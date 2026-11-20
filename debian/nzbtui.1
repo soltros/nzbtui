@@ -1,0 +1,39 @@
+.TH NZBTUI 1 "November 2026" "nzbtui 0.1.0" "User Commands"
+.SH NAME
+nzbtui \- standalone terminal Usenet client built with Ratatui
+.SH SYNOPSIS
+.B nzbtui
+[\fIOPTIONS\fR]
+.SH DESCRIPTION
+.B nzbtui
+is a standalone Rust TUI Usenet client with direct Newznab indexer search,
+multi-connection TLS NNTP downloading with priority backup fallback, yEnc
+decoding, on-demand PAR2 verification/repair, and archive extraction.
+.SH OPTIONS
+.TP
+.BR \-c ", " \-\-config " " \fIPATH\fR
+Use an alternate JSON configuration file (default: \fI~/.config/nzbtui/config.json\fR).
+.TP
+.BR \-i ", " \-\-import " " \fINZB_FILE\fR
+Immediately enqueue one or more local .nzb files on startup. May be repeated.
+.TP
+.BR \-\-print\-config\-path
+Print the default configuration file path and exit.
+.TP
+.BR \-h ", " \-\-help
+Show command-line help.
+.TP
+.BR \-V ", " \-\-version
+Show version information.
+.SH FILES
+.TP
+.I ~/.config/nzbtui/config.json
+User configuration (providers, indexers, download paths, post-processing). Saved with mode 0600.
+.TP
+.I ~/.local/share/nzbtui/history.json
+Completed and failed download history.
+.SH SEE ALSO
+.BR par2 (1),
+.BR 7z (1),
+.BR unrar (1),
+.BR unzip (1)

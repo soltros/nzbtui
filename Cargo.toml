@@ -1,0 +1,59 @@
+[package]
+name = "nzbtui"
+version = "0.1.0"
+edition = "2021"
+authors = ["Derrik Diener <142091676+soltros@users.noreply.github.com>"]
+description = "Standalone Rust TUI Usenet client built with Ratatui — direct Newznab search, multi-connection NNTP/TLS downloading, yEnc decoding, PAR2 repair, and archive extraction."
+license = "GPL-3.0-or-later"
+readme = "README.md"
+keywords = ["usenet", "nzb", "tui", "ratatui", "nntp"]
+categories = ["command-line-utilities", "network-programming"]
+
+[[bin]]
+name = "nzbtui"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+crc32fast = "1"
+crossterm = { version = "0.28", features = ["event-stream"] }
+directories = "6"
+futures = "0.3"
+quick-xml = "0.37"
+ratatui = "0.29"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "deflate"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+webpki-roots = "0.26"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+
+[package.metadata.deb]
+maintainer = "Derrik Diener <142091676+soltros@users.noreply.github.com>"
+copyright = "2026, Derrik Diener"
+license-file = ["LICENSE", "0"]
+extended-description = """Standalone terminal Usenet client built in Rust with Ratatui.
+Supports direct Newznab indexer search, multiple NNTP/TLS providers with
+priority fallback, yEnc decoding with CRC verification, PAR2 verification
+and repair, and automatic archive extraction — without any web server."""
+depends = "$auto"
+recommends = "par2, 7zip | p7zip-full, unrar | unrar-free, unzip"
+section = "net"
+priority = "optional"
+assets = [
+    ["target/release/nzbtui", "usr/bin/nzbtui", "755"],
+    ["README.md", "usr/share/doc/nzbtui/README.md", "644"],
+    ["debian/nzbtui.1", "usr/share/man/man1/nzbtui.1", "644"],
+]
