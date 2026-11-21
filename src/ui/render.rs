@@ -133,10 +133,11 @@ fn draw_search(frame: &mut Frame, app: &App, area: Rect) {
     let bar_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Min(28),
+            Constraint::Min(24),
+            Constraint::Length(16),
+            Constraint::Length(16),
             Constraint::Length(18),
-            Constraint::Length(20),
-            Constraint::Length(14),
+            Constraint::Length(12),
         ])
         .split(chunks[0]);
 
@@ -192,6 +193,30 @@ fn draw_search(frame: &mut Frame, app: &App, area: Rect) {
         );
     frame.render_widget(cat_box, bar_chunks[1]);
 
+    let season_label = if app.search_season.trim().is_empty() {
+        "All".to_string()
+    } else if app.search_season.trim() == "00" {
+        "00 (Packs)".to_string()
+    } else {
+        format!("S{}", app.search_season.trim())
+    };
+    let season_style = if app.search_season.trim().is_empty() {
+        Style::default().fg(theme::TEXT)
+    } else {
+        Style::default()
+            .fg(theme::ACCENT)
+            .add_modifier(Modifier::BOLD)
+    };
+    let season_box = Paragraph::new(season_label)
+        .style(season_style)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(theme::border())
+                .title(Span::styled(" Season [S] ", theme::subtext())),
+        );
+    frame.render_widget(season_box, bar_chunks[2]);
+
     let idx_box = Paragraph::new(app.current_indexer_filter_label())
         .style(Style::default().fg(theme::TEXT))
         .block(
@@ -200,7 +225,7 @@ fn draw_search(frame: &mut Frame, app: &App, area: Rect) {
                 .border_style(theme::border())
                 .title(Span::styled(" Indexer [i] ", theme::subtext())),
         );
-    frame.render_widget(idx_box, bar_chunks[2]);
+    frame.render_widget(idx_box, bar_chunks[3]);
 
     let sort_box = Paragraph::new(app.search_sort.label())
         .style(Style::default().fg(theme::TEXT))
@@ -210,7 +235,7 @@ fn draw_search(frame: &mut Frame, app: &App, area: Rect) {
                 .border_style(theme::border())
                 .title(Span::styled(" Sort [o] ", theme::subtext())),
         );
-    frame.render_widget(sort_box, bar_chunks[3]);
+    frame.render_widget(sort_box, bar_chunks[4]);
 
     // Results table
     if app.search_results.is_empty() {
@@ -472,7 +497,7 @@ fn draw_downloads(frame: &mut Frame, app: &App, area: Rect) {
             })
             .title(Span::styled(
                 format!(
-                    " History ({}) — [Enter] Details  [x] Remove  [C] Clear All ",
+                    " History ({}) — [Enter] Details  [x] Remove  [c] Cleanup  [C] Clear All ",
                     app.snapshot.history.len()
                 ),
                 if hist_focused {
@@ -1096,10 +1121,10 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         let hint = match app.active_tab {
             ActiveTab::Search => {
-                " [/] Search  [c] Category  [i] Indexer  [o] Sort  [Enter/d] Download  [I] Import .nzb "
+                " [/] Search  [c] Cat  [S] Season  [i] Indexer  [o] Sort  [Enter/d] Download  [I] Import .nzb "
             }
             ActiveTab::Downloads => {
-                " [Space] Pause Job  [P] Pause All  [x] Cancel  [K/J] Move  [w] Switch Pane  [Enter] Details "
+                " [Space] Pause Job  [P] Pause All  [x] Cancel  [c] Cleanup  [K/J] Move  [w] Switch Pane  [Enter] Details "
             }
             ActiveTab::Settings => {
                 " [h/l] Switch Section  [a] Add  [e] Edit  [t] Test  [Space] Toggle  [d] Delete "
@@ -1406,7 +1431,7 @@ fn draw_job_details_modal(frame: &mut Frame, job: &JobSummary, area: Rect) {
 }
 
 fn draw_help_modal(frame: &mut Frame, area: Rect) {
-    let popup = centered_rect(70, 26, area);
+    let popup = centered_rect(70, 27, area);
     frame.render_widget(Clear, popup);
 
     let lines = vec![
@@ -1420,6 +1445,7 @@ fn draw_help_modal(frame: &mut Frame, area: Rect) {
         Line::from(Span::styled(" Search View", theme::title())),
         Line::from("   / or s              Focus search bar (Enter to run, Esc to blur)"),
         Line::from("   c / C               Cycle Newznab category filter"),
+        Line::from("   S                   Filter by season (00 = full season packs)"),
         Line::from("   i / o               Cycle indexer filter / sort order"),
         Line::from("   Enter or d          Fetch NZB and enqueue download"),
         Line::from(""),
@@ -1427,7 +1453,8 @@ fn draw_help_modal(frame: &mut Frame, area: Rect) {
         Line::from("   Space / p           Pause or resume selected job"),
         Line::from("   x / Delete          Cancel active job or remove history item"),
         Line::from("   K / J               Move queued job priority up / down"),
-        Line::from("   w / Enter / C       Switch Queue/History | Details | Clear history"),
+        Line::from("   w / Enter           Switch Queue/History | Details"),
+        Line::from("   c / C               Cleanup failed & temp dirs | Clear all history"),
         Line::from(""),
         Line::from(Span::styled(" Settings & Export Views", theme::title())),
         Line::from("   h / l               Switch Providers / Indexers / General / Export Targets"),

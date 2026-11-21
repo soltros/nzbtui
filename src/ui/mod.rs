@@ -2,7 +2,7 @@ pub mod render;
 pub mod theme;
 
 use crate::config::{expand_tilde, AppConfig, ExportTarget, IndexerConfig, ProviderConfig};
-use crate::engine::{DownloadEngine, EngineSnapshot, JobStatus, JobSummary, LogLevel};
+use crate::engine::{format_bytes, DownloadEngine, EngineSnapshot, JobStatus, JobSummary, LogLevel};
 use crate::newznab::{NewznabClient, SearchResult, CATEGORIES};
 use crate::nntp;
 use crate::nzb::NzbDocument;
@@ -251,6 +251,7 @@ impl IndexerForm {
 #[derive(Debug, Clone)]
 pub enum TextPromptKind {
     ImportNzb,
+    SearchSeason,
     DownloadDir,
     TempDir,
     MaxConcurrentJobs,
@@ -379,6 +380,7 @@ pub struct App {
     pub search_query: String,
     pub search_input_focused: bool,
     pub search_category_idx: usize,
+    pub search_season: String,
     /// 0 = All Enabled Indexers, 1..=N = specific indexer
     pub search_indexer_idx: usize,
     pub search_sort: SearchSort,
@@ -449,6 +451,7 @@ impl App {
             search_query: String::new(),
             search_input_focused: false,
             search_category_idx: 0,
+            search_season: String::new(),
             search_indexer_idx: 0,
             search_sort: SearchSort::DateDesc,
             search_loading: false,
@@ -696,6 +699,15 @@ impl App {
                     self.search_category_idx - 1
                 };
             }
+            KeyCode::Char('S') => {
+                self.modal = Some(Modal::TextPrompt(TextPrompt {
+                    kind: TextPromptKind::SearchSeason,
+                    title: "Filter by Season".into(),
+                    hint: "Season number (00 = full season/series packs on NZBGeek, empty = All)"
+                        .into(),
+                    value: self.search_season.clone(),
+                }));
+            }
             KeyCode::Char('i') => {
                 let count = self.config.enabled_indexers().len() + 1;
                 self.search_indexer_idx = (self.search_indexer_idx + 1) % count.max(1);
@@ -801,6 +813,27 @@ impl App {
                     }
                 }
             }
+            KeyCode::Char('c') => match self.engine.cleanup_downloads().await {
+                Ok(report) => {
+                    self.snapshot = self.engine.snapshot().await;
+                    if report.removed_history == 0 && report.removed_temp_dirs == 0 {
+                        self.set_toast("Nothing to clean up", false);
+                    } else {
+                        self.set_toast(
+                            format!(
+                                "Cleanup: {} failed/cancelled removed, {} temp dir(s) ({} freed)",
+                                report.removed_history,
+                                report.removed_temp_dirs,
+                                format_bytes(report.freed_bytes)
+                            ),
+                            false,
+                        );
+                    }
+                }
+                Err(err) => {
+                    self.set_toast(format!("Cleanup failed: {}", err), true);
+                }
+            },
             KeyCode::Char('C') => {
                 self.engine.clear_history().await;
                 self.set_toast("Cleared download history", false);
@@ -1440,6 +1473,19 @@ impl App {
                                     let _ = tx.send(AsyncEvent::LocalImportResult(res));
                                 });
                             }
+                            TextPromptKind::SearchSeason => {
+                                self.search_season = val;
+                                if !self.config.enabled_indexers().is_empty() {
+                                    self.trigger_search();
+                                } else if self.search_season.is_empty() {
+                                    self.set_toast("Season filter cleared (All)", false);
+                                } else {
+                                    self.set_toast(
+                                        format!("Season filter set to '{}'", self.search_season),
+                                        false,
+                                    );
+                                }
+                            }
                             TextPromptKind::DownloadDir => {
                                 if !val.is_empty() {
                                     self.config.downloads.download_dir =
@@ -1505,6 +1551,7 @@ impl App {
 
         let query = self.search_query.clone();
         let cat = CATEGORIES[self.search_category_idx].id.to_string();
+        let season = self.search_season.trim().to_string();
         let limit = self.config.ui.search_limit;
         let client = Arc::clone(&self.newznab);
         let tx = self.async_tx.clone();
@@ -1512,18 +1559,26 @@ impl App {
 
         self.search_loading = true;
         tokio::spawn(async move {
+            let season_opt = if season.is_empty() {
+                None
+            } else {
+                Some(season.as_str())
+            };
             engine
                 .log(
                     LogLevel::Info,
                     format!(
-                        "Searching {} indexer(s) for '{}' (cat={})",
+                        "Searching {} indexer(s) for '{}' (cat={}, season={})",
                         target_indexers.len(),
                         if query.is_empty() { "<latest>" } else { &query },
-                        if cat.is_empty() { "all" } else { &cat }
+                        if cat.is_empty() { "all" } else { &cat },
+                        season_opt.unwrap_or("all")
                     ),
                 )
                 .await;
-            let (results, errors) = client.search_all(&target_indexers, &query, &cat, limit).await;
+            let (results, errors) = client
+                .search_all(&target_indexers, &query, &cat, season_opt, limit)
+                .await;
             let _ = tx.send(AsyncEvent::SearchCompleted { results, errors });
         });
     }

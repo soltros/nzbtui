@@ -81,11 +81,12 @@ impl NewznabClient {
         indexers: &[IndexerConfig],
         query: &str,
         category_id: &str,
+        season: Option<&str>,
         limit: usize,
     ) -> (Vec<SearchResult>, Vec<String>) {
         let futures = indexers
             .iter()
-            .map(|idx| self.search_one(idx, query, category_id, limit));
+            .map(|idx| self.search_one(idx, query, category_id, season, limit));
         let outcomes = join_all(futures).await;
 
         let mut results = Vec::new();
@@ -108,21 +109,11 @@ impl NewznabClient {
         indexer: &IndexerConfig,
         query: &str,
         category_id: &str,
+        season: Option<&str>,
         limit: usize,
     ) -> Result<Vec<SearchResult>> {
         let endpoint = indexer.api_endpoint();
-        let mut params: Vec<(&str, String)> = vec![
-            ("t", "search".to_string()),
-            ("apikey", indexer.api_key.clone()),
-            ("extended", "1".to_string()),
-            ("limit", limit.to_string()),
-        ];
-        if !query.trim().is_empty() {
-            params.push(("q", query.trim().to_string()));
-        }
-        if !category_id.is_empty() {
-            params.push(("cat", category_id.to_string()));
-        }
+        let params = build_search_params(&indexer.api_key, query, category_id, season, limit);
 
         let resp = self
             .http
@@ -466,6 +457,37 @@ fn extract_newznab_attr(
     }
 }
 
+pub fn build_search_params(
+    api_key: &str,
+    query: &str,
+    category_id: &str,
+    season: Option<&str>,
+    limit: usize,
+) -> Vec<(&'static str, String)> {
+    let season_trimmed = season.map(str::trim).filter(|s| !s.is_empty());
+    let search_type = if season_trimmed.is_some() {
+        "tvsearch"
+    } else {
+        "search"
+    };
+    let mut params: Vec<(&'static str, String)> = vec![
+        ("t", search_type.to_string()),
+        ("apikey", api_key.to_string()),
+        ("extended", "1".to_string()),
+        ("limit", limit.to_string()),
+    ];
+    if !query.trim().is_empty() {
+        params.push(("q", query.trim().to_string()));
+    }
+    if !category_id.is_empty() {
+        params.push(("cat", category_id.to_string()));
+    }
+    if let Some(s) = season_trimmed {
+        params.push(("season", s.to_string()));
+    }
+    params
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -504,5 +526,23 @@ mod tests {
         let xml = br#"<?xml version="1.0"?><error code="100" description="Incorrect user credentials"/>"#;
         let err = parse_newznab_rss(xml, "TestIdx", "bad").unwrap_err();
         assert!(err.to_string().contains("Incorrect user credentials"));
+    }
+
+    #[test]
+    fn test_build_search_params_with_season() {
+        let normal = build_search_params("key", "ubuntu", "4000", None, 100);
+        assert!(normal.contains(&("t", "search".to_string())));
+        assert!(!normal.iter().any(|(k, _)| *k == "season"));
+
+        let packs = build_search_params("key", "South Park", "5000", Some("00"), 100);
+        assert!(packs.contains(&("t", "tvsearch".to_string())));
+        assert!(packs.contains(&("season", "00".to_string())));
+        assert!(packs.contains(&("q", "South Park".to_string())));
+        assert!(packs.contains(&("cat", "5000".to_string())));
+
+        let s2 = build_search_params("key", "Severance", "", Some(" 2 "), 50);
+        assert!(s2.contains(&("t", "tvsearch".to_string())));
+        assert!(s2.contains(&("season", "2".to_string())));
+        assert!(!s2.iter().any(|(k, _)| *k == "cat"));
     }
 }

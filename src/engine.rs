@@ -132,6 +132,13 @@ impl JobSummary {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CleanupReport {
+    pub removed_history: usize,
+    pub removed_temp_dirs: usize,
+    pub freed_bytes: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct EngineSnapshot {
     pub queue: Vec<JobSummary>,
@@ -479,6 +486,51 @@ impl DownloadEngine {
         .await;
 
         Ok(dest_path)
+    }
+
+    /// Removes Failed/Cancelled history entries and deletes orphaned job temp directories
+    /// in `temp_dir` that do not belong to any currently queued or active job.
+    pub async fn cleanup_downloads(&self) -> Result<CleanupReport> {
+        let active_ids: std::collections::HashSet<String> = {
+            let q = self.queue.read().await;
+            q.iter().map(|j| j.summary.id.to_string()).collect()
+        };
+
+        let removed_history = {
+            let mut hist = self.history.write().await;
+            let before = hist.len();
+            hist.retain(|h| h.status == JobStatus::Completed);
+            before.saturating_sub(hist.len())
+        };
+        if removed_history > 0 {
+            self.persist_history().await;
+        }
+
+        let temp_dir = { self.config.read().await.downloads.temp_dir.clone() };
+        let (removed_temp_dirs, freed_bytes) = tokio::task::spawn_blocking(move || {
+            cleanup_orphaned_temp_dirs(&temp_dir, &active_ids)
+        })
+        .await
+        .map_err(|e| anyhow!("Cleanup task failed: {}", e))??;
+
+        let report = CleanupReport {
+            removed_history,
+            removed_temp_dirs,
+            freed_bytes,
+        };
+
+        self.log(
+            LogLevel::Info,
+            format!(
+                "Download cleanup: removed {} failed/cancelled history item(s), {} orphaned temp dir(s) ({} freed)",
+                report.removed_history,
+                report.removed_temp_dirs,
+                format_bytes(report.freed_bytes)
+            ),
+        )
+        .await;
+
+        Ok(report)
     }
 
     pub async fn shutdown(&self) {
@@ -1324,6 +1376,49 @@ fn remove_path_recursive(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn dir_size_recursive(path: &Path) -> u64 {
+    let Ok(entries) = fs::read_dir(path) else {
+        return 0;
+    };
+    let mut total = 0u64;
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            total = total.saturating_add(dir_size_recursive(&p));
+        } else if let Ok(meta) = entry.metadata() {
+            total = total.saturating_add(meta.len());
+        }
+    }
+    total
+}
+
+fn cleanup_orphaned_temp_dirs(
+    temp_dir: &Path,
+    active_ids: &std::collections::HashSet<String>,
+) -> Result<(usize, u64)> {
+    if !temp_dir.exists() {
+        return Ok((0, 0));
+    }
+    let mut removed = 0usize;
+    let mut freed = 0u64;
+    for entry in fs::read_dir(temp_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if Uuid::parse_str(&name).is_ok() && !active_ids.contains(&name) {
+            let size = dir_size_recursive(&path);
+            if fs::remove_dir_all(&path).is_ok() {
+                removed += 1;
+                freed = freed.saturating_add(size);
+            }
+        }
+    }
+    Ok((removed, freed))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1372,6 +1467,35 @@ mod tests {
             fs::read(dst_folder.join("subs").join("en.srt")).unwrap(),
             b"srt"
         );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_cleanup_orphaned_temp_dirs() {
+        let tmp = std::env::temp_dir().join(format!("nzbtui_cleanup_test_{}", Uuid::new_v4()));
+        let active_id = Uuid::new_v4();
+        let stale_id = Uuid::new_v4();
+
+        let active_dir = tmp.join(active_id.to_string());
+        let stale_dir = tmp.join(stale_id.to_string());
+        let non_uuid_dir = tmp.join("keep_me");
+        fs::create_dir_all(&active_dir).unwrap();
+        fs::create_dir_all(&stale_dir).unwrap();
+        fs::create_dir_all(&non_uuid_dir).unwrap();
+
+        fs::write(active_dir.join("part1"), b"12345").unwrap();
+        fs::write(stale_dir.join("part1"), b"1234567890").unwrap();
+
+        let mut active_set = std::collections::HashSet::new();
+        active_set.insert(active_id.to_string());
+
+        let (removed, freed) = cleanup_orphaned_temp_dirs(&tmp, &active_set).unwrap();
+        assert_eq!(removed, 1);
+        assert_eq!(freed, 10);
+        assert!(active_dir.exists());
+        assert!(!stale_dir.exists());
+        assert!(non_uuid_dir.exists());
 
         let _ = fs::remove_dir_all(&tmp);
     }

@@ -1,6 +1,6 @@
 [package]
 name = "nzbtui"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 authors = ["Derrik Diener <142091676+soltros@users.noreply.github.com>"]
 description = "Standalone Rust TUI Usenet client built with Ratatui — direct Newznab search, multi-connection NNTP/TLS downloading, yEnc decoding, PAR2 repair, and archive extraction."
