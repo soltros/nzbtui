@@ -28,11 +28,19 @@ EOF
 done
 
 ARCH="$(uname -m)"
-if [[ "$ARCH" != "x86_64" && "$ARCH" != "amd64" ]]; then
-  echo "Error: prebuilt generic binary is currently for x86_64 (detected: $ARCH)." >&2
-  echo "You can build from source with: cargo install --git https://github.com/${REPO}.git" >&2
-  exit 1
-fi
+case "$ARCH" in
+  x86_64|amd64)
+    ASSET_NAME="nzbtui-linux-x86_64"
+    ;;
+  i386|i586|i686|x86)
+    ASSET_NAME="nzbtui-linux-x86-musl"
+    ;;
+  *)
+    echo "Error: no prebuilt generic binary for detected architecture: $ARCH." >&2
+    echo "You can build from source with: cargo install --git https://github.com/${REPO}.git" >&2
+    exit 1
+    ;;
+esac
 
 if [[ "$SYSTEM_INSTALL" -eq 1 || "$(id -u)" -eq 0 ]]; then
   INSTALL_DIR="/usr/local/bin"

@@ -401,6 +401,7 @@ pub struct App {
 
     // Overlays
     pub modal: Option<Modal>,
+    pub modal_scroll: u16,
     pub toast: Option<Toast>,
 
     // Async event channel
@@ -470,6 +471,7 @@ impl App {
             export_marked: HashSet::new(),
 
             modal: None,
+            modal_scroll: 0,
             toast: None,
 
             async_tx,
@@ -1456,11 +1458,30 @@ impl App {
         };
 
         match modal {
-            Modal::Help | Modal::JobDetails(_) => {
-                if !matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char('?')) {
+            Modal::Help | Modal::JobDetails(_) => match key.code {
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char('?') => {
+                    self.modal_scroll = 0;
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.modal_scroll = self.modal_scroll.saturating_add(1);
                     self.modal = Some(modal);
                 }
-            }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.modal_scroll = self.modal_scroll.saturating_sub(1);
+                    self.modal = Some(modal);
+                }
+                KeyCode::PageDown => {
+                    self.modal_scroll = self.modal_scroll.saturating_add(6);
+                    self.modal = Some(modal);
+                }
+                KeyCode::PageUp => {
+                    self.modal_scroll = self.modal_scroll.saturating_sub(6);
+                    self.modal = Some(modal);
+                }
+                _ => {
+                    self.modal = Some(modal);
+                }
+            },
             Modal::Provider(mut form) => {
                 match key.code {
                     KeyCode::Esc => return,

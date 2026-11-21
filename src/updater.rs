@@ -15,7 +15,25 @@ pub enum InstallMethod {
     Deb,
     Rpm,
     ArchPacman,
+    AlpineApk,
     Standalone,
+}
+
+pub fn alpine_arch() -> &'static str {
+    match std::env::consts::ARCH {
+        "x86" => "x86",
+        "x86_64" => "x86_64",
+        "aarch64" => "aarch64",
+        other => other,
+    }
+}
+
+pub fn standalone_asset_name() -> &'static str {
+    match std::env::consts::ARCH {
+        "x86" => "nzbtui-linux-x86-musl",
+        "aarch64" => "nzbtui-linux-aarch64",
+        _ => "nzbtui-linux-x86_64",
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -40,6 +58,9 @@ pub fn detect_install_method(exe_path: &Path) -> InstallMethod {
     }
     if command_succeeds("pacman", &["-Qo", &exe_str]) {
         return InstallMethod::ArchPacman;
+    }
+    if command_succeeds("apk", &["info", "--who-owns", &exe_str]) {
+        return InstallMethod::AlpineApk;
     }
     InstallMethod::Standalone
 }
@@ -249,21 +270,86 @@ pub async fn check_and_self_update(apply: bool, is_cli: bool) -> Result<UpdateOu
                 tag_name
             ))
         }
-        InstallMethod::Standalone => {
-            let bin_url = assets
+        InstallMethod::AlpineApk => {
+            if !is_cli {
+                return Ok(UpdateOutcome {
+                    latest_version: tag_name.clone(),
+                    updated: false,
+                    message: format!(
+                        "Update {} available (Alpine APK) — exit and run: nzbtui --update",
+                        tag_name
+                    ),
+                });
+            }
+            let arch_suffix = format!("-{}.apk", alpine_arch());
+            let apk_url = assets
                 .iter()
                 .find(|a| {
                     a.get("name")
                         .and_then(|n| n.as_str())
-                        .map(|n| n == "nzbtui-linux-x86_64")
+                        .map(|n| n.ends_with(&arch_suffix))
                         .unwrap_or(false)
                 })
                 .and_then(|a| a.get("browser_download_url"))
                 .and_then(|u| u.as_str())
                 .ok_or_else(|| {
                     anyhow!(
-                        "Release {} does not contain nzbtui-linux-x86_64 asset",
+                        "No Alpine APK asset (*{}) found in release {}",
+                        arch_suffix,
                         tag_name
+                    )
+                })?;
+
+            let bytes = client
+                .get(apk_url)
+                .send()
+                .await?
+                .error_for_status()?
+                .bytes()
+                .await?;
+            let tmp_apk = std::env::temp_dir().join(format!(
+                "nzbtui_{}_{}.apk",
+                tag_name,
+                alpine_arch()
+            ));
+            fs::write(&tmp_apk, &bytes)?;
+
+            let status = Command::new("apk")
+                .args(["add", "--allow-untrusted", "--upgrade"])
+                .arg(&tmp_apk)
+                .status()
+                .context("Failed to invoke apk")?;
+            let _ = fs::remove_file(&tmp_apk);
+
+            if status.success() {
+                Ok(UpdateOutcome {
+                    latest_version: tag_name.clone(),
+                    updated: true,
+                    message: format!("Updated Alpine APK package to {}!", tag_name),
+                })
+            } else {
+                Err(anyhow!(
+                    "apk add failed — run as root or with doas/sudo: nzbtui --update"
+                ))
+            }
+        }
+        InstallMethod::Standalone => {
+            let want_asset = standalone_asset_name();
+            let bin_url = assets
+                .iter()
+                .find(|a| {
+                    a.get("name")
+                        .and_then(|n| n.as_str())
+                        .map(|n| n == want_asset)
+                        .unwrap_or(false)
+                })
+                .and_then(|a| a.get("browser_download_url"))
+                .and_then(|u| u.as_str())
+                .ok_or_else(|| {
+                    anyhow!(
+                        "Release {} does not contain {} asset",
+                        tag_name,
+                        want_asset
                     )
                 })?;
 

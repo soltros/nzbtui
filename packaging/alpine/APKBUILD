@@ -1,0 +1,34 @@
+# Maintainer: Derrik Diener <142091676+soltros@users.noreply.github.com>
+pkgname=nzbtui
+pkgver=0.4.1
+pkgrel=0
+pkgdesc="Standalone Rust TUI Usenet client built with Ratatui (Alpine & iSH compatible)"
+url="https://github.com/soltros/nzbtui"
+arch="x86 x86_64 aarch64"
+license="GPL-3.0-or-later"
+makedepends="cargo"
+subpackages="$pkgname-doc"
+options="!check net"
+source="$pkgname-$pkgver.tar.gz::https://github.com/soltros/nzbtui/archive/refs/tags/v$pkgver.tar.gz"
+
+prepare() {
+	default_prepare
+	cargo fetch --target="$CTARGET" --locked
+}
+
+build() {
+	local target
+	target="$(rustc -vV | sed -n 's/^host: //p')"
+	# Passing --target ensures +crt-static applies only to the binary (not proc-macros)
+	RUSTFLAGS="${RUSTFLAGS:-} -C target-feature=+crt-static" \
+		cargo build --release --frozen --target "$target"
+}
+
+package() {
+	local target
+	target="$(rustc -vV | sed -n 's/^host: //p')"
+	install -Dm755 "target/$target/release/$pkgname" "$pkgdir"/usr/bin/"$pkgname"
+	install -Dm644 debian/"$pkgname".1 "$pkgdir"/usr/share/man/man1/"$pkgname".1
+	install -Dm644 README.md "$pkgdir"/usr/share/doc/"$pkgname"/README.md
+	install -Dm644 LICENSE "$pkgdir"/usr/share/licenses/"$pkgname"/LICENSE
+}

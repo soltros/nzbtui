@@ -32,14 +32,36 @@ Search Newznab indexers, enqueue downloads directly, stream articles over multi-
 | `?` | Help overlay |
 | `q` / `Ctrl+C` | Quit |
 
-## Building the Ubuntu `.deb` Package
+## Building Packages
+
+### Ubuntu / Debian (`.deb`)
 
 ```bash
 ./scripts/build-deb.sh
-sudo apt install ./target/debian/nzbtui_0.1.0_amd64.deb
+sudo apt install ./target/debian/nzbtui_0.4.1_amd64.deb
 ```
 
 Using `sudo apt install ./target/debian/...deb` (instead of `dpkg -i`) automatically installs recommended post-processing tools (`par2`, `7zip`/`p7zip-full`, `unrar`, `unzip`) if they are not already present.
+
+### Alpine Linux & iSH for iOS (`.apk`)
+
+The Alpine package builds a **statically linked musl binary** (`+crt-static`) so it runs cleanly across Alpine versions — including **iSH on iOS** (32-bit `x86` Alpine):
+
+```bash
+# Build 32-bit x86 APK for iSH on iOS (or pass `x86_64` or `all`)
+./scripts/build-apk.sh x86
+```
+
+Install on **iSH (iOS)** or Alpine Linux:
+
+```sh
+apk add --allow-untrusted ./nzbtui-0.4.1-r0-x86.apk
+# Optional post-processing tools on Alpine/iSH:
+apk add par2cmdline 7zip unrar unzip
+nzbtui
+```
+
+The TUI automatically scales to narrow and short mobile terminals (compact tabs, inline search filters, single-pane Downloads toggle, stacked/scrollable forms, and scrollable Help/Details modals).
 
 ## Configuration File
 

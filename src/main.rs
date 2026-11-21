@@ -52,8 +52,24 @@ struct Cli {
     update: bool,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    let mut rt_builder = tokio::runtime::Builder::new_multi_thread();
+    rt_builder.enable_all();
+
+    // Keep thread count and stack allocations lean on 32-bit x86 (e.g., iSH on iOS)
+    #[cfg(target_arch = "x86")]
+    {
+        rt_builder
+            .worker_threads(2)
+            .max_blocking_threads(8)
+            .thread_stack_size(2 * 1024 * 1024);
+    }
+
+    let rt = rt_builder.build()?;
+    rt.block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     let cli = Cli::parse();
 
     let config_path = cli
