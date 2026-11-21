@@ -1,6 +1,7 @@
 use super::theme;
 use super::{
-    ActiveTab, App, DownloadsPane, IndexerForm, Modal, ProviderForm, SettingsSection, TextPrompt,
+    ActiveTab, App, DownloadsPane, ExportTargetForm, IndexerForm, Modal, ProviderForm,
+    SettingsSection, TextPrompt,
 };
 use crate::config::mask_secret;
 use crate::engine::{format_bytes, format_eta, format_speed, JobStatus, JobSummary, LogLevel};
@@ -32,6 +33,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
         ActiveTab::Downloads => draw_downloads(frame, app, outer[1]),
         ActiveTab::Settings => draw_settings(frame, app, outer[1]),
         ActiveTab::Logs => draw_logs(frame, app, outer[1]),
+        ActiveTab::Export => draw_export(frame, app, outer[1]),
     }
 
     draw_footer(frame, app, outer[2]);
@@ -41,6 +43,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
             Modal::Help => draw_help_modal(frame, area),
             Modal::Provider(form) => draw_provider_modal(frame, form, area),
             Modal::Indexer(form) => draw_indexer_modal(frame, form, area),
+            Modal::ExportTarget(form) => draw_export_target_modal(frame, form, area),
             Modal::TextPrompt(prompt) => draw_text_prompt_modal(frame, prompt, area),
             Modal::JobDetails(job) => draw_job_details_modal(frame, job, area),
         }
@@ -64,6 +67,7 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(format!(" {} ", queue_badge)),
         Line::from(" 3:Settings "),
         Line::from(" 4:Logs "),
+        Line::from(" 5:Export "),
     ];
 
     let tabs = Tabs::new(tab_titles)
@@ -502,11 +506,16 @@ fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(format!(" Usenet Providers ({}) ", app.config.providers.len())),
         Line::from(format!(" Newznab Indexers ({}) ", app.config.indexers.len())),
         Line::from(" General & Post-Processing "),
+        Line::from(format!(
+            " Export Targets ({}) ",
+            app.config.export_targets.len()
+        )),
     ];
     let sub_idx = match app.settings_section {
         SettingsSection::Providers => 0,
         SettingsSection::Indexers => 1,
         SettingsSection::General => 2,
+        SettingsSection::Export => 3,
     };
 
     let sub_tabs = Tabs::new(sub_titles)
@@ -531,6 +540,7 @@ fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
         SettingsSection::Providers => draw_providers_settings(frame, app, chunks[1]),
         SettingsSection::Indexers => draw_indexers_settings(frame, app, chunks[1]),
         SettingsSection::General => draw_general_settings(frame, app, chunks[1]),
+        SettingsSection::Export => draw_export_targets_settings(frame, app, chunks[1]),
     }
 }
 
@@ -815,6 +825,58 @@ fn draw_general_settings(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(tools_box, chunks[1]);
 }
 
+fn draw_export_targets_settings(frame: &mut Frame, app: &App, area: Rect) {
+    let title = " Export Targets (Tag -> Destination Path) — [a] Add  [e] Edit  [d] Delete ";
+
+    if app.config.export_targets.is_empty() {
+        let p = Paragraph::new(
+            "No export targets configured yet.\n\nPress [a] to add a tag and destination directory (for example, tag 'Movie' -> '~/Videos/Movies').\nThen in [5:Export], press [t] to tag completed downloads and [e] to export them.",
+        )
+        .style(theme::subtext())
+        .wrap(Wrap { trim: true })
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(theme::border_focused())
+                .title(Span::styled(title, theme::title())),
+        );
+        frame.render_widget(p, area);
+        return;
+    }
+
+    let header = Row::new(vec!["Tag", "Destination Path"]).style(theme::table_header());
+    let rows: Vec<Row> = app
+        .config
+        .export_targets
+        .iter()
+        .map(|t| {
+            Row::new(vec![
+                Cell::from(t.tag.clone()).style(
+                    Style::default()
+                        .fg(theme::ACCENT)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Cell::from(t.path.display().to_string()).style(Style::default().fg(theme::TEXT)),
+            ])
+        })
+        .collect();
+
+    let table = Table::new(rows, [Constraint::Length(22), Constraint::Min(30)])
+        .header(header)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(theme::border_focused())
+                .title(Span::styled(title, theme::title())),
+        )
+        .row_highlight_style(theme::selected_row())
+        .highlight_symbol("▸ ");
+
+    let mut state = TableState::default();
+    state.select(Some(app.export_target_selected));
+    frame.render_stateful_widget(table, area, &mut state);
+}
+
 fn draw_logs(frame: &mut Frame, app: &App, area: Rect) {
     let lines: Vec<Line> = app
         .snapshot
@@ -861,6 +923,157 @@ fn draw_logs(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(log_widget, area);
 }
 
+fn draw_export(frame: &mut Frame, app: &App, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(5)])
+        .split(area);
+
+    // Top bar: configured export targets + Move/Copy mode
+    let mode_label = if app.export_move_mode { "MOVE" } else { "COPY" };
+    let targets_summary = if app.config.export_targets.is_empty() {
+        "No export targets set — go to [3] Settings -> Export Targets -> [a] to add tags & paths."
+            .to_string()
+    } else {
+        app.config
+            .export_targets
+            .iter()
+            .map(|t| format!("{}: {}", t.tag, t.path.display()))
+            .collect::<Vec<_>>()
+            .join("  |  ")
+    };
+    let bar = Paragraph::new(Line::from(vec![
+        Span::styled(
+            format!(" Mode [m]: {}  ", mode_label),
+            Style::default()
+                .fg(theme::ACCENT)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(targets_summary, theme::subtext()),
+    ]))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(theme::border())
+            .title(Span::styled(" Configured Export Targets ", theme::subtext())),
+    );
+    frame.render_widget(bar, chunks[0]);
+
+    let items = app.export_items();
+    let title = format!(
+        " Download Export ({}) — [t] Cycle Tag  [e/Enter] Export  [E] Export All Tagged  [m] Move/Copy ",
+        items.len()
+    );
+
+    if items.is_empty() {
+        let empty = Paragraph::new(
+            "No completed downloads available to export yet.\n\nFinished downloads will appear here so you can tag them (e.g. Movie, TV) and export them to your configured directories.",
+        )
+        .style(theme::subtext())
+        .wrap(Wrap { trim: true })
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(theme::border_focused())
+                .title(Span::styled(title, theme::title())),
+        );
+        frame.render_widget(empty, chunks[1]);
+        return;
+    }
+
+    let header = Row::new(vec![
+        "State",
+        "Title",
+        "Size",
+        "Tag",
+        "Destination",
+    ])
+    .style(theme::table_header());
+
+    let rows: Vec<Row> = items
+        .iter()
+        .map(|job| {
+            let source_exists = job
+                .output_path
+                .as_ref()
+                .map(|p| p.exists())
+                .unwrap_or(false);
+
+            let (state_label, state_style) = if job.exported_to.is_some() {
+                ("EXPORTED", theme::success().add_modifier(Modifier::BOLD))
+            } else if !source_exists {
+                ("MISSING", theme::danger())
+            } else if let Some(tag) = job.export_tag.as_deref() {
+                if app.config.export_path_for_tag(tag).is_some() {
+                    ("READY", Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD))
+                } else {
+                    ("NO PATH", theme::warning())
+                }
+            } else {
+                ("UNTAGGED", theme::muted())
+            };
+
+            let tag_cell = job
+                .export_tag
+                .clone()
+                .unwrap_or_else(|| "-".to_string());
+            let tag_style = if job.export_tag.is_some() {
+                Style::default()
+                    .fg(theme::ACCENT)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                theme::muted()
+            };
+
+            let dest_cell = if let Some(ref exported) = job.exported_to {
+                exported.display().to_string()
+            } else if let Some(tag) = job.export_tag.as_deref() {
+                app.config
+                    .export_path_for_tag(tag)
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "(no path configured for tag)".to_string())
+            } else {
+                job.output_path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "-".to_string())
+            };
+
+            Row::new(vec![
+                Cell::from(state_label).style(state_style),
+                Cell::from(job.title.clone()).style(Style::default().fg(theme::TEXT)),
+                Cell::from(format_bytes(job.total_bytes)).style(theme::subtext()),
+                Cell::from(tag_cell).style(tag_style),
+                Cell::from(dest_cell).style(theme::subtext()),
+            ])
+        })
+        .collect();
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(10),
+            Constraint::Percentage(36),
+            Constraint::Length(10),
+            Constraint::Length(14),
+            Constraint::Min(24),
+        ],
+    )
+    .header(header)
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(theme::border_focused())
+            .title(Span::styled(title, theme::title())),
+    )
+    .row_highlight_style(theme::selected_row())
+    .highlight_symbol("▸ ");
+
+    let mut state = TableState::default();
+    state.select(Some(app.export_selected.min(items.len().saturating_sub(1))));
+    frame.render_stateful_widget(table, chunks[1], &mut state);
+}
+
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -892,12 +1105,15 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
                 " [h/l] Switch Section  [a] Add  [e] Edit  [t] Test  [Space] Toggle  [d] Delete "
             }
             ActiveTab::Logs => " [j/k] Scroll  [G] Bottom  [a] Toggle Auto-Scroll ",
+            ActiveTab::Export => {
+                " [t] Cycle Tag  [e/Enter] Export Selected  [E] Export All Tagged  [m] Move/Copy "
+            }
         };
         frame.render_widget(Paragraph::new(hint).style(theme::subtext()), chunks[0]);
     }
 
     let global_bar = Line::from(vec![
-        Span::styled(" [1-4/Tab]", Style::default().fg(theme::ACCENT)),
+        Span::styled(" [1-5/Tab]", Style::default().fg(theme::ACCENT)),
         Span::styled(" Views  ", theme::muted()),
         Span::styled("[I]", Style::default().fg(theme::ACCENT)),
         Span::styled(" Import NZB  ", theme::muted()),
@@ -1038,6 +1254,53 @@ fn draw_indexer_modal(frame: &mut Frame, form: &IndexerForm, area: Rect) {
     frame.render_widget(widget, popup);
 }
 
+fn draw_export_target_modal(frame: &mut Frame, form: &ExportTargetForm, area: Rect) {
+    let popup = centered_rect(64, 10, area);
+    frame.render_widget(Clear, popup);
+
+    let title = if form.edit_index.is_some() {
+        " Edit Export Target "
+    } else {
+        " Add Export Target "
+    };
+
+    let fields = [
+        ("Tag Name (e.g. Movie, TV)", form.tag.clone()),
+        ("Destination Directory", form.path.clone()),
+    ];
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (idx, (label, val)) in fields.into_iter().enumerate() {
+        let active = idx == form.field;
+        let cursor = if active { "▌" } else { "" };
+        let marker = if active { "▸ " } else { "  " };
+        let label_style = if active { theme::title() } else { theme::subtext() };
+        let val_style = if active {
+            Style::default().fg(theme::TEXT).bg(theme::HIGHLIGHT_BG)
+        } else {
+            Style::default().fg(theme::TEXT)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{}{:<28} ", marker, label), label_style),
+            Span::styled(format!(" {}{} ", val, cursor), val_style),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  [Tab/↑↓] Next/Prev Field   [Enter] Save   [Esc] Cancel",
+        theme::muted(),
+    )));
+
+    let widget = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(theme::border_focused())
+            .style(Style::default().bg(theme::MODAL_BG))
+            .title(Span::styled(title, theme::title())),
+    );
+    frame.render_widget(widget, popup);
+}
+
 fn draw_text_prompt_modal(frame: &mut Frame, prompt: &TextPrompt, area: Rect) {
     let popup = centered_rect(66, 8, area);
     frame.render_widget(Clear, popup);
@@ -1143,32 +1406,33 @@ fn draw_job_details_modal(frame: &mut Frame, job: &JobSummary, area: Rect) {
 }
 
 fn draw_help_modal(frame: &mut Frame, area: Rect) {
-    let popup = centered_rect(68, 22, area);
+    let popup = centered_rect(70, 26, area);
     frame.render_widget(Clear, popup);
 
     let lines = vec![
         Line::from(Span::styled(" Global Keys", theme::title())),
-        Line::from("   1 / 2 / 3 / 4     Jump to Search / Downloads / Settings / Logs"),
-        Line::from("   Tab / Shift+Tab   Cycle views"),
-        Line::from("   I                 Import a local .nzb file"),
-        Line::from("   P                 Pause / resume all downloads"),
-        Line::from("   ? / q / Ctrl+C    Help / Quit"),
+        Line::from("   1 / 2 / 3 / 4 / 5   Jump to Search / Downloads / Settings / Logs / Export"),
+        Line::from("   Tab / Shift+Tab     Cycle views"),
+        Line::from("   I                   Import a local .nzb file"),
+        Line::from("   P                   Pause / resume all downloads"),
+        Line::from("   ? / q / Ctrl+C      Help / Quit"),
         Line::from(""),
         Line::from(Span::styled(" Search View", theme::title())),
-        Line::from("   / or s            Focus search bar (Enter to run, Esc to blur)"),
-        Line::from("   c / C             Cycle Newznab category filter"),
-        Line::from("   i / o             Cycle indexer filter / sort order"),
-        Line::from("   Enter or d        Fetch NZB and enqueue download"),
+        Line::from("   / or s              Focus search bar (Enter to run, Esc to blur)"),
+        Line::from("   c / C               Cycle Newznab category filter"),
+        Line::from("   i / o               Cycle indexer filter / sort order"),
+        Line::from("   Enter or d          Fetch NZB and enqueue download"),
         Line::from(""),
         Line::from(Span::styled(" Downloads View", theme::title())),
-        Line::from("   Space / p         Pause or resume selected job"),
-        Line::from("   x / Delete        Cancel active job or remove history item"),
-        Line::from("   K / J             Move queued job priority up / down"),
-        Line::from("   w / Enter / C     Switch Queue/History | Details | Clear history"),
+        Line::from("   Space / p           Pause or resume selected job"),
+        Line::from("   x / Delete          Cancel active job or remove history item"),
+        Line::from("   K / J               Move queued job priority up / down"),
+        Line::from("   w / Enter / C       Switch Queue/History | Details | Clear history"),
         Line::from(""),
-        Line::from(Span::styled(" Settings View", theme::title())),
-        Line::from("   h / l             Switch Providers / Indexers / General"),
-        Line::from("   a / e / d / t     Add / Edit / Delete / Live Test Connection"),
+        Line::from(Span::styled(" Settings & Export Views", theme::title())),
+        Line::from("   h / l               Switch Providers / Indexers / General / Export Targets"),
+        Line::from("   a / e / d / t       Add / Edit / Delete / Live Test Connection"),
+        Line::from("   t / e / E / m       Export: Cycle Tag / Export / Export All / Move-Copy"),
     ];
 
     let widget = Paragraph::new(lines).block(

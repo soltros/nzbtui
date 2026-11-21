@@ -104,6 +104,10 @@ pub struct JobSummary {
     pub stage_detail: String,
     pub error: Option<String>,
     pub output_path: Option<PathBuf>,
+    #[serde(default)]
+    pub export_tag: Option<String>,
+    #[serde(default)]
+    pub exported_to: Option<PathBuf>,
     pub added_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
 }
@@ -281,6 +285,8 @@ impl DownloadEngine {
             stage_detail: "Waiting in queue".to_string(),
             error: None,
             output_path: None,
+            export_tag: None,
+            exported_to: None,
             added_at: Utc::now(),
             finished_at: None,
         };
@@ -390,6 +396,89 @@ impl DownloadEngine {
     pub async fn remove_history_item(&self, id: Uuid) {
         self.history.write().await.retain(|h| h.id != id);
         self.persist_history().await;
+    }
+
+    pub async fn set_history_export_tag(&self, id: Uuid, tag: Option<String>) {
+        {
+            let mut hist = self.history.write().await;
+            if let Some(item) = hist.iter_mut().find(|h| h.id == id) {
+                item.export_tag = tag;
+            }
+        }
+        self.persist_history().await;
+    }
+
+    /// Exports a completed history item (file or directory) into `dest_dir`.
+    /// When `move_files` is true, moves the item (with cross-filesystem copy+remove fallback)
+    /// and updates `output_path` to the new location.
+    pub async fn export_history_item(
+        &self,
+        id: Uuid,
+        dest_dir: &Path,
+        move_files: bool,
+    ) -> Result<PathBuf> {
+        let (title, src) = {
+            let hist = self.history.read().await;
+            let item = hist
+                .iter()
+                .find(|h| h.id == id)
+                .ok_or_else(|| anyhow!("Download item not found in history"))?;
+            if item.status != JobStatus::Completed {
+                return Err(anyhow!("Only completed downloads can be exported"));
+            }
+            let src = item
+                .output_path
+                .clone()
+                .ok_or_else(|| anyhow!("No output path recorded for '{}'", item.title))?;
+            (item.title.clone(), src)
+        };
+
+        if !src.exists() {
+            return Err(anyhow!("Source path does not exist: {}", src.display()));
+        }
+
+        let file_name = src
+            .file_name()
+            .ok_or_else(|| anyhow!("Invalid source path: {}", src.display()))?
+            .to_os_string();
+        let dest_path = dest_dir.join(&file_name);
+
+        if dest_path.exists() {
+            return Err(anyhow!(
+                "Destination already exists: {}",
+                dest_path.display()
+            ));
+        }
+
+        let src_clone = src.clone();
+        let dest_dir_clone = dest_dir.to_path_buf();
+        let dest_path_clone = dest_path.clone();
+
+        tokio::task::spawn_blocking(move || {
+            transfer_path(&src_clone, &dest_dir_clone, &dest_path_clone, move_files)
+        })
+        .await
+        .map_err(|e| anyhow!("Export task failed: {}", e))??;
+
+        {
+            let mut hist = self.history.write().await;
+            if let Some(item) = hist.iter_mut().find(|h| h.id == id) {
+                item.exported_to = Some(dest_path.clone());
+                if move_files {
+                    item.output_path = Some(dest_path.clone());
+                }
+            }
+        }
+        self.persist_history().await;
+
+        let verb = if move_files { "Moved" } else { "Copied" };
+        self.log(
+            LogLevel::Success,
+            format!("{} '{}' -> {}", verb, title, dest_path.display()),
+        )
+        .await;
+
+        Ok(dest_path)
     }
 
     pub async fn shutdown(&self) {
@@ -1187,3 +1276,103 @@ pub fn format_eta(secs: Option<u64>) -> String {
 // Re-export Instant silence unused warning if needed
 #[allow(dead_code)]
 fn _unused(_: Instant) {}
+
+fn transfer_path(src: &Path, dest_dir: &Path, dest_path: &Path, move_files: bool) -> Result<()> {
+    fs::create_dir_all(dest_dir)
+        .map_err(|e| anyhow!("Failed to create export directory {}: {}", dest_dir.display(), e))?;
+
+    if move_files {
+        if fs::rename(src, dest_path).is_ok() {
+            return Ok(());
+        }
+        // Fallback for cross-device / cross-filesystem moves
+        copy_path_recursive(src, dest_path)?;
+        remove_path_recursive(src)?;
+    } else {
+        copy_path_recursive(src, dest_path)?;
+    }
+    Ok(())
+}
+
+fn copy_path_recursive(src: &Path, dst: &Path) -> Result<()> {
+    if src.is_dir() {
+        fs::create_dir_all(dst)?;
+        for entry in fs::read_dir(src)? {
+            let entry = entry?;
+            let child_dst = dst.join(entry.file_name());
+            copy_path_recursive(&entry.path(), &child_dst)?;
+        }
+    } else {
+        fs::copy(src, dst).map_err(|e| {
+            anyhow!(
+                "Failed to copy {} to {}: {}",
+                src.display(),
+                dst.display(),
+                e
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn remove_path_recursive(path: &Path) -> Result<()> {
+    if path.is_dir() {
+        fs::remove_dir_all(path)?;
+    } else if path.exists() {
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_transfer_path_move_and_copy_file() {
+        let tmp = std::env::temp_dir().join(format!("nzbtui_test_{}", Uuid::new_v4()));
+        let src_dir = tmp.join("src");
+        let dst_dir = tmp.join("dst");
+        fs::create_dir_all(&src_dir).unwrap();
+
+        let file_a = src_dir.join("movie.mkv");
+        fs::write(&file_a, b"video-data").unwrap();
+
+        // Copy mode keeps source
+        let copied_dst = dst_dir.join("movie.mkv");
+        transfer_path(&file_a, &dst_dir, &copied_dst, false).unwrap();
+        assert!(file_a.exists());
+        assert_eq!(fs::read(&copied_dst).unwrap(), b"video-data");
+
+        // Move mode removes source
+        let dst_dir2 = tmp.join("dst2");
+        let moved_dst = dst_dir2.join("movie.mkv");
+        transfer_path(&file_a, &dst_dir2, &moved_dst, true).unwrap();
+        assert!(!file_a.exists());
+        assert_eq!(fs::read(&moved_dst).unwrap(), b"video-data");
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_transfer_path_directory() {
+        let tmp = std::env::temp_dir().join(format!("nzbtui_test_{}", Uuid::new_v4()));
+        let src_folder = tmp.join("My.Movie.2026");
+        fs::create_dir_all(src_folder.join("subs")).unwrap();
+        fs::write(src_folder.join("movie.mkv"), b"mkv").unwrap();
+        fs::write(src_folder.join("subs").join("en.srt"), b"srt").unwrap();
+
+        let dst_dir = tmp.join("movies");
+        let dst_folder = dst_dir.join("My.Movie.2026");
+        transfer_path(&src_folder, &dst_dir, &dst_folder, true).unwrap();
+
+        assert!(!src_folder.exists());
+        assert_eq!(fs::read(dst_folder.join("movie.mkv")).unwrap(), b"mkv");
+        assert_eq!(
+            fs::read(dst_folder.join("subs").join("en.srt")).unwrap(),
+            b"srt"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+}

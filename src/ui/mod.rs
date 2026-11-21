@@ -1,8 +1,8 @@
 pub mod render;
 pub mod theme;
 
-use crate::config::{expand_tilde, AppConfig, IndexerConfig, ProviderConfig};
-use crate::engine::{DownloadEngine, EngineSnapshot, JobSummary, LogLevel};
+use crate::config::{expand_tilde, AppConfig, ExportTarget, IndexerConfig, ProviderConfig};
+use crate::engine::{DownloadEngine, EngineSnapshot, JobStatus, JobSummary, LogLevel};
 use crate::newznab::{NewznabClient, SearchResult, CATEGORIES};
 use crate::nntp;
 use crate::nzb::NzbDocument;
@@ -20,6 +20,7 @@ pub enum ActiveTab {
     Downloads,
     Settings,
     Logs,
+    Export,
 }
 
 impl ActiveTab {
@@ -29,6 +30,7 @@ impl ActiveTab {
             ActiveTab::Downloads => 1,
             ActiveTab::Settings => 2,
             ActiveTab::Logs => 3,
+            ActiveTab::Export => 4,
         }
     }
 
@@ -37,16 +39,18 @@ impl ActiveTab {
             ActiveTab::Search => ActiveTab::Downloads,
             ActiveTab::Downloads => ActiveTab::Settings,
             ActiveTab::Settings => ActiveTab::Logs,
-            ActiveTab::Logs => ActiveTab::Search,
+            ActiveTab::Logs => ActiveTab::Export,
+            ActiveTab::Export => ActiveTab::Search,
         }
     }
 
     pub fn prev(self) -> Self {
         match self {
-            ActiveTab::Search => ActiveTab::Logs,
+            ActiveTab::Search => ActiveTab::Export,
             ActiveTab::Downloads => ActiveTab::Search,
             ActiveTab::Settings => ActiveTab::Downloads,
             ActiveTab::Logs => ActiveTab::Settings,
+            ActiveTab::Export => ActiveTab::Logs,
         }
     }
 }
@@ -90,6 +94,7 @@ pub enum SettingsSection {
     Providers,
     Indexers,
     General,
+    Export,
 }
 
 impl SettingsSection {
@@ -97,15 +102,17 @@ impl SettingsSection {
         match self {
             SettingsSection::Providers => SettingsSection::Indexers,
             SettingsSection::Indexers => SettingsSection::General,
-            SettingsSection::General => SettingsSection::Providers,
+            SettingsSection::General => SettingsSection::Export,
+            SettingsSection::Export => SettingsSection::Providers,
         }
     }
 
     pub fn prev(self) -> Self {
         match self {
-            SettingsSection::Providers => SettingsSection::General,
+            SettingsSection::Providers => SettingsSection::Export,
             SettingsSection::Indexers => SettingsSection::Providers,
             SettingsSection::General => SettingsSection::Indexers,
+            SettingsSection::Export => SettingsSection::General,
         }
     }
 }
@@ -258,10 +265,56 @@ pub struct TextPrompt {
 }
 
 #[derive(Debug, Clone)]
+pub struct ExportTargetForm {
+    pub edit_index: Option<usize>,
+    pub field: usize,
+    pub tag: String,
+    pub path: String,
+}
+
+impl ExportTargetForm {
+    pub const FIELD_COUNT: usize = 2;
+
+    pub fn new_empty() -> Self {
+        Self {
+            edit_index: None,
+            field: 0,
+            tag: String::new(),
+            path: String::from("~/"),
+        }
+    }
+
+    pub fn from_config(cfg: &ExportTarget, edit_index: Option<usize>) -> Self {
+        Self {
+            edit_index,
+            field: 0,
+            tag: cfg.tag.clone(),
+            path: cfg.path.display().to_string(),
+        }
+    }
+
+    pub fn into_config(&self) -> Result<ExportTarget, String> {
+        let tag = self.tag.trim().to_string();
+        if tag.is_empty() {
+            return Err("Tag name cannot be empty (e.g. Movie, TV, Music)".into());
+        }
+        let raw_path = self.path.trim();
+        if raw_path.is_empty() {
+            return Err("Destination path cannot be empty".into());
+        }
+        Ok(ExportTarget {
+            tag,
+            path: expand_tilde(&PathBuf::from(raw_path)),
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
 pub enum Modal {
     Help,
     Provider(ProviderForm),
     Indexer(IndexerForm),
+    ExportTarget(ExportTargetForm),
     TextPrompt(TextPrompt),
     JobDetails(JobSummary),
 }
@@ -344,11 +397,16 @@ pub struct App {
     pub provider_selected: usize,
     pub indexer_selected: usize,
     pub general_selected: usize,
+    pub export_target_selected: usize,
     pub testing_status: Option<String>,
 
     // Logs state
     pub log_scroll: usize,
     pub log_auto_scroll: bool,
+
+    // Export state
+    pub export_selected: usize,
+    pub export_move_mode: bool,
 
     // Overlays
     pub modal: Option<Modal>,
@@ -406,10 +464,14 @@ impl App {
             provider_selected: 0,
             indexer_selected: 0,
             general_selected: 0,
+            export_target_selected: 0,
             testing_status: None,
 
             log_scroll: 0,
             log_auto_scroll: true,
+
+            export_selected: 0,
+            export_move_mode: true,
 
             modal: None,
             toast: None,
@@ -574,6 +636,10 @@ impl App {
                 self.active_tab = ActiveTab::Logs;
                 return;
             }
+            KeyCode::Char('5') => {
+                self.active_tab = ActiveTab::Export;
+                return;
+            }
             KeyCode::Tab => {
                 self.active_tab = self.active_tab.next();
                 return;
@@ -611,6 +677,7 @@ impl App {
             ActiveTab::Downloads => self.handle_downloads_key(key).await,
             ActiveTab::Settings => self.handle_settings_key(key).await,
             ActiveTab::Logs => self.handle_logs_key(key),
+            ActiveTab::Export => self.handle_export_key(key).await,
         }
     }
 
@@ -967,6 +1034,40 @@ impl App {
                     _ => {}
                 }
             }
+            SettingsSection::Export => match key.code {
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if !self.config.export_targets.is_empty() {
+                        self.export_target_selected = (self.export_target_selected + 1)
+                            .min(self.config.export_targets.len() - 1);
+                    }
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.export_target_selected = self.export_target_selected.saturating_sub(1);
+                }
+                KeyCode::Char('a') => {
+                    self.modal = Some(Modal::ExportTarget(ExportTargetForm::new_empty()));
+                }
+                KeyCode::Char('e') | KeyCode::Enter => {
+                    if let Some(target) = self.config.export_targets.get(self.export_target_selected)
+                    {
+                        self.modal = Some(Modal::ExportTarget(ExportTargetForm::from_config(
+                            target,
+                            Some(self.export_target_selected),
+                        )));
+                    }
+                }
+                KeyCode::Char('d') | KeyCode::Delete => {
+                    if self.export_target_selected < self.config.export_targets.len() {
+                        let removed = self.config.export_targets.remove(self.export_target_selected);
+                        self.export_target_selected = self
+                            .export_target_selected
+                            .min(self.config.export_targets.len().saturating_sub(1));
+                        self.persist_config().await;
+                        self.set_toast(format!("Deleted export target '{}'", removed.tag), false);
+                    }
+                }
+                _ => {}
+            },
         }
     }
 
@@ -984,6 +1085,140 @@ impl App {
             }
             KeyCode::Char('a') => {
                 self.log_auto_scroll = !self.log_auto_scroll;
+            }
+            _ => {}
+        }
+    }
+
+    pub fn export_items(&self) -> Vec<&JobSummary> {
+        self.snapshot
+            .history
+            .iter()
+            .filter(|j| j.status == JobStatus::Completed)
+            .collect()
+    }
+
+    async fn handle_export_key(&mut self, key: KeyEvent) {
+        let items_len = self.export_items().len();
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => {
+                if items_len > 0 {
+                    self.export_selected = (self.export_selected + 1).min(items_len - 1);
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.export_selected = self.export_selected.saturating_sub(1);
+            }
+            KeyCode::Char('m') => {
+                self.export_move_mode = !self.export_move_mode;
+                self.set_toast(
+                    if self.export_move_mode {
+                        "Export mode: MOVE files"
+                    } else {
+                        "Export mode: COPY files"
+                    },
+                    false,
+                );
+            }
+            KeyCode::Char('t') => {
+                if self.config.export_targets.is_empty() {
+                    self.set_toast(
+                        "No export targets configured — press [3] Settings -> Export Targets -> [a]",
+                        true,
+                    );
+                    return;
+                }
+                let Some(job) = self.export_items().get(self.export_selected).cloned().cloned()
+                else {
+                    return;
+                };
+                let next_tag = match job.export_tag.as_deref() {
+                    None => Some(self.config.export_targets[0].tag.clone()),
+                    Some(current) => {
+                        let idx = self
+                            .config
+                            .export_targets
+                            .iter()
+                            .position(|t| t.tag.eq_ignore_ascii_case(current));
+                        match idx {
+                            Some(i) if i + 1 < self.config.export_targets.len() => {
+                                Some(self.config.export_targets[i + 1].tag.clone())
+                            }
+                            _ => None,
+                        }
+                    }
+                };
+                self.engine
+                    .set_history_export_tag(job.id, next_tag.clone())
+                    .await;
+                self.snapshot = self.engine.snapshot().await;
+                let label = next_tag.unwrap_or_else(|| "(untagged)".to_string());
+                self.set_toast(format!("Tagged '{}' as {}", job.title, label), false);
+            }
+            KeyCode::Char('e') | KeyCode::Enter => {
+                let Some(job) = self.export_items().get(self.export_selected).cloned().cloned()
+                else {
+                    return;
+                };
+                let Some(tag) = job.export_tag.as_deref() else {
+                    self.set_toast("Item has no tag — press [t] to tag it first", true);
+                    return;
+                };
+                let Some(dest_dir) = self.config.export_path_for_tag(tag).cloned() else {
+                    self.set_toast(
+                        format!("No export path configured for tag '{}' in Settings", tag),
+                        true,
+                    );
+                    return;
+                };
+                match self
+                    .engine
+                    .export_history_item(job.id, &dest_dir, self.export_move_mode)
+                    .await
+                {
+                    Ok(dest) => {
+                        self.snapshot = self.engine.snapshot().await;
+                        self.set_toast(format!("Exported to {}", dest.display()), false);
+                    }
+                    Err(err) => {
+                        self.set_toast(format!("Export failed: {}", err), true);
+                    }
+                }
+            }
+            KeyCode::Char('E') => {
+                let candidates: Vec<(uuid::Uuid, PathBuf)> = self
+                    .export_items()
+                    .into_iter()
+                    .filter(|j| j.exported_to.is_none())
+                    .filter_map(|j| {
+                        let tag = j.export_tag.as_deref()?;
+                        let dest = self.config.export_path_for_tag(tag)?.clone();
+                        Some((j.id, dest))
+                    })
+                    .collect();
+
+                if candidates.is_empty() {
+                    self.set_toast("No untagged or pending items to export", false);
+                    return;
+                }
+
+                let mut ok_count = 0usize;
+                let mut err_count = 0usize;
+                for (id, dest_dir) in candidates {
+                    match self
+                        .engine
+                        .export_history_item(id, &dest_dir, self.export_move_mode)
+                        .await
+                    {
+                        Ok(_) => ok_count += 1,
+                        Err(_) => err_count += 1,
+                    }
+                }
+                self.snapshot = self.engine.snapshot().await;
+                self.set_toast(
+                    format!("Batch export: {} succeeded, {} failed", ok_count, err_count),
+                    err_count > 0,
+                );
             }
             _ => {}
         }
@@ -1121,6 +1356,58 @@ impl App {
                     _ => {}
                 }
                 self.modal = Some(Modal::Indexer(form));
+            }
+            Modal::ExportTarget(mut form) => {
+                match key.code {
+                    KeyCode::Esc => return,
+                    KeyCode::Down | KeyCode::Tab => {
+                        form.field = (form.field + 1) % ExportTargetForm::FIELD_COUNT;
+                    }
+                    KeyCode::Up | KeyCode::BackTab => {
+                        form.field = if form.field == 0 {
+                            ExportTargetForm::FIELD_COUNT - 1
+                        } else {
+                            form.field - 1
+                        };
+                    }
+                    KeyCode::Enter => match form.into_config() {
+                        Ok(cfg) => {
+                            let tag = cfg.tag.clone();
+                            if let Some(idx) = form.edit_index {
+                                if idx < self.config.export_targets.len() {
+                                    self.config.export_targets[idx] = cfg;
+                                }
+                            } else {
+                                self.config.export_targets.push(cfg);
+                                self.export_target_selected =
+                                    self.config.export_targets.len() - 1;
+                            }
+                            self.persist_config().await;
+                            self.set_toast(format!("Saved export target '{}'", tag), false);
+                            return;
+                        }
+                        Err(err) => {
+                            self.set_toast(err, true);
+                        }
+                    },
+                    KeyCode::Backspace => {
+                        if let Some(s) = export_target_field_mut(&mut form) {
+                            s.pop();
+                        }
+                    }
+                    KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        if let Some(s) = export_target_field_mut(&mut form) {
+                            s.clear();
+                        }
+                    }
+                    KeyCode::Char(c) => {
+                        if let Some(s) = export_target_field_mut(&mut form) {
+                            s.push(c);
+                        }
+                    }
+                    _ => {}
+                }
+                self.modal = Some(Modal::ExportTarget(form));
             }
             Modal::TextPrompt(mut prompt) => {
                 match key.code {
@@ -1325,6 +1612,14 @@ fn indexer_field_mut(form: &mut IndexerForm) -> Option<&mut String> {
         0 => Some(&mut form.name),
         1 => Some(&mut form.url),
         2 => Some(&mut form.api_key),
+        _ => None,
+    }
+}
+
+fn export_target_field_mut(form: &mut ExportTargetForm) -> Option<&mut String> {
+    match form.field {
+        0 => Some(&mut form.tag),
+        1 => Some(&mut form.path),
         _ => None,
     }
 }

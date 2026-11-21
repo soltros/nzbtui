@@ -13,7 +13,15 @@ pub struct AppConfig {
     #[serde(default)]
     pub indexers: Vec<IndexerConfig>,
     #[serde(default)]
+    pub export_targets: Vec<ExportTarget>,
+    #[serde(default)]
     pub ui: UiConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExportTarget {
+    pub tag: String,
+    pub path: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -142,6 +150,7 @@ impl Default for AppConfig {
             downloads: DownloadConfig::default(),
             providers: Vec::new(),
             indexers: Vec::new(),
+            export_targets: Vec::new(),
             ui: UiConfig::default(),
         }
     }
@@ -207,6 +216,9 @@ impl AppConfig {
             .with_context(|| format!("Failed to parse JSON config {}", path.display()))?;
         cfg.downloads.download_dir = expand_tilde(&cfg.downloads.download_dir);
         cfg.downloads.temp_dir = expand_tilde(&cfg.downloads.temp_dir);
+        for target in &mut cfg.export_targets {
+            target.path = expand_tilde(&target.path);
+        }
         Ok(cfg)
     }
 
@@ -251,6 +263,14 @@ impl AppConfig {
             .filter(|i| i.enabled && !i.url.trim().is_empty() && !i.api_key.trim().is_empty())
             .cloned()
             .collect()
+    }
+
+    /// Returns the configured export destination path for a given tag (case-insensitive).
+    pub fn export_path_for_tag(&self, tag: &str) -> Option<&PathBuf> {
+        self.export_targets
+            .iter()
+            .find(|t| t.tag.eq_ignore_ascii_case(tag))
+            .map(|t| &t.path)
     }
 }
 
@@ -319,5 +339,22 @@ mod tests {
         let parsed: AppConfig = serde_json::from_str(&s).unwrap();
         assert_eq!(parsed.providers.len(), 1);
         assert_eq!(parsed.providers[0].host, "news.example.com");
+    }
+
+    #[test]
+    fn test_export_targets_roundtrip_and_lookup() {
+        let mut cfg = AppConfig::default();
+        cfg.export_targets.push(ExportTarget {
+            tag: "Movie".into(),
+            path: PathBuf::from("/media/movies"),
+        });
+        let s = serde_json::to_string_pretty(&cfg).unwrap();
+        let parsed: AppConfig = serde_json::from_str(&s).unwrap();
+        assert_eq!(parsed.export_targets.len(), 1);
+        assert_eq!(
+            parsed.export_path_for_tag("movie"),
+            Some(&PathBuf::from("/media/movies"))
+        );
+        assert_eq!(parsed.export_path_for_tag("tv"), None);
     }
 }
