@@ -1,5 +1,5 @@
 use crate::config::PostProcessConfig;
-use crate::nzb::sanitize_filename;
+use crate::nzb::{is_obfuscated_name, sanitize_filename};
 use anyhow::{anyhow, Context, Result};
 use regex::Regex;
 use std::fs;
@@ -466,9 +466,55 @@ pub fn finalize_output(
         }
     }
 
+    rename_obfuscated_files(&final_dir, &folder_name);
+
     // Remove temporary working directory
     let _ = fs::remove_dir_all(work_dir);
     Ok(final_dir)
+}
+
+/// If `final_dir` contains obfuscated filenames (e.g. `350127o75I6o3L1o5w08w68K5y275182.mkv`)
+/// and `clean_title` is a readable release name, rename them to `<clean_title>.<ext>`.
+fn rename_obfuscated_files(dir: &Path, clean_title: &str) {
+    if clean_title.is_empty() || is_obfuscated_name(clean_title) {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if !is_obfuscated_name(name) {
+            continue;
+        }
+        let target_name = match path.extension().and_then(|e| e.to_str()) {
+            Some(ext) if !ext.is_empty() => format!("{}.{}", clean_title, ext),
+            _ => clean_title.to_string(),
+        };
+        let mut dst = dir.join(&target_name);
+        if dst.exists() {
+            let mut n = 2usize;
+            loop {
+                let candidate = match path.extension().and_then(|e| e.to_str()) {
+                    Some(ext) if !ext.is_empty() => format!("{}-{}.{}", clean_title, n, ext),
+                    _ => format!("{}-{}", clean_title, n),
+                };
+                let p = dir.join(candidate);
+                if !p.exists() {
+                    dst = p;
+                    break;
+                }
+                n += 1;
+            }
+        }
+        let _ = fs::rename(&path, &dst);
+    }
 }
 
 fn is_archive_or_par2(filename: &str) -> bool {

@@ -239,12 +239,32 @@ impl NzbDocument {
             .or(title_password);
         let category = meta.get("category").cloned();
 
+        let title = if !clean_title.is_empty() && !is_obfuscated_name(&clean_title) {
+            clean_title
+        } else if let Some(alt_meta) = ["name", "proper_name", "release", "nzbname"]
+            .iter()
+            .filter_map(|k| meta.get(*k))
+            .map(|v| extract_brace_password(v).0)
+            .find(|v| !v.is_empty() && !is_obfuscated_name(v))
+        {
+            alt_meta
+        } else if !fallback_title.trim().is_empty() && !is_obfuscated_name(fallback_title) {
+            fallback_title.trim().to_string()
+        } else if let Some(file_title) = files
+            .iter()
+            .find(|f| f.role == FileRole::Regular)
+            .map(|f| infer_title_from_filename(&f.filename))
+            .filter(|t| !t.is_empty() && !is_obfuscated_name(t))
+        {
+            file_title
+        } else if !clean_title.is_empty() {
+            clean_title
+        } else {
+            fallback_title.trim().to_string()
+        };
+
         Ok(Self {
-            title: if clean_title.is_empty() {
-                fallback_title.to_string()
-            } else {
-                clean_title
-            },
+            title,
             password,
             category,
             meta,
@@ -319,6 +339,38 @@ pub fn sanitize_filename(name: &str) -> String {
     cleaned.trim_matches('.').trim().to_string()
 }
 
+/// Returns true if `name` (ignoring a trailing 2-5 char extension) looks like an
+/// obfuscated Usenet hash/random string (e.g. `350127o75I6o3L1o5w08w68K5y275182.mkv`).
+pub fn is_obfuscated_name(name: &str) -> bool {
+    let trimmed = name.trim();
+    let stem = match trimmed.rsplit_once('.') {
+        Some((s, ext))
+            if (2..=5).contains(&ext.len()) && ext.chars().all(|c| c.is_ascii_alphanumeric()) =>
+        {
+            s
+        }
+        _ => trimmed,
+    };
+    if stem.len() < 12 || !stem.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return false;
+    }
+    let has_digit = stem.chars().any(|c| c.is_ascii_digit());
+    let has_alpha = stem.chars().any(|c| c.is_ascii_alphabetic());
+    has_digit && has_alpha
+}
+
+fn infer_title_from_filename(filename: &str) -> String {
+    let trimmed = filename.trim();
+    match trimmed.rsplit_once('.') {
+        Some((stem, ext))
+            if (2..=5).contains(&ext.len()) && ext.chars().all(|c| c.is_ascii_alphanumeric()) =>
+        {
+            stem.trim().to_string()
+        }
+        _ => trimmed.to_string(),
+    }
+}
+
 pub fn classify_file_role(filename: &str) -> FileRole {
     let lower = filename.to_lowercase();
     if lower.ends_with(".par2") {
@@ -377,5 +429,39 @@ mod tests {
         assert_eq!(doc.files[2].role, FileRole::Par2Recovery);
         assert_eq!(doc.initial_download_bytes(), 1_012_000);
         assert_eq!(doc.recovery_bytes(), 250_000);
+    }
+
+    #[test]
+    fn test_obfuscated_title_falls_back_to_search_title() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+  <head>
+    <meta type="title">350127o75I6o3L1o5w08w68K5y275182.mkv</meta>
+  </head>
+  <file poster="u@e.com" date="1700000000" subject="350127o75I6o3L1o5w08w68K5y275182.mkv (1/1)">
+    <groups><group>alt.binaries.test</group></groups>
+    <segments><segment bytes="100" number="1">id1@e.com</segment></segments>
+  </file>
+</nzb>"#;
+        let doc = NzbDocument::parse(xml, "Some.Movie.2026.1080p.WEB-DL").unwrap();
+        assert_eq!(doc.title, "Some.Movie.2026.1080p.WEB-DL");
+        assert!(is_obfuscated_name("350127o75I6o3L1o5w08w68K5y275182.mkv"));
+        assert!(!is_obfuscated_name("Some.Movie.2026.1080p.WEB-DL"));
+        assert!(!is_obfuscated_name("Interstellar"));
+
+        // Also infer from <meta type="name"> when <meta type="title"> is obfuscated and fallback is empty
+        let xml_with_name = br#"<?xml version="1.0" encoding="UTF-8"?>
+<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+  <head>
+    <meta type="title">350127o75I6o3L1o5w08w68K5y275182.mkv</meta>
+    <meta type="name">Inferred.From.Meta.Name.2026</meta>
+  </head>
+  <file poster="u@e.com" date="1700000000" subject="350127o75I6o3L1o5w08w68K5y275182.mkv (1/1)">
+    <groups><group>alt.binaries.test</group></groups>
+    <segments><segment bytes="100" number="1">id1@e.com</segment></segments>
+  </file>
+</nzb>"#;
+        let doc2 = NzbDocument::parse(xml_with_name, "").unwrap();
+        assert_eq!(doc2.title, "Inferred.From.Meta.Name.2026");
     }
 }

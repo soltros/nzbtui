@@ -1604,6 +1604,11 @@ impl App {
             match client.fetch_nzb(&item.nzb_url, &item.indexer_api_key).await {
                 Ok(bytes) => match NzbDocument::parse(&bytes, &item.title) {
                     Ok(mut nzb) => {
+                        if !item.title.trim().is_empty()
+                            && !crate::nzb::is_obfuscated_name(&item.title)
+                        {
+                            nzb.title = item.title.trim().to_string();
+                        }
                         if nzb.category.is_none() && !item.category.is_empty() {
                             nzb.category = Some(item.category.clone());
                         }
