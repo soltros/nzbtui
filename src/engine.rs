@@ -148,6 +148,8 @@ pub struct EngineSnapshot {
     pub speed_history: Vec<u64>,
     pub active_connections: usize,
     pub max_connections: usize,
+    pub speed_limit_kbps: u64,
+    pub free_disk_bytes: Option<u64>,
     pub logs: Vec<LogEntry>,
 }
 
@@ -167,6 +169,17 @@ struct PersistedHistory {
     history: Vec<JobSummary>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedQueueItem {
+    summary: JobSummary,
+    nzb: NzbDocument,
+}
+
+#[derive(Debug, Serialize, Deserialize, Default)]
+struct PersistedQueue {
+    queue: Vec<PersistedQueueItem>,
+}
+
 pub struct DownloadEngine {
     config: Arc<RwLock<AppConfig>>,
     queue: Arc<RwLock<Vec<ManagedJob>>>,
@@ -177,19 +190,30 @@ pub struct DownloadEngine {
     bytes_window: Arc<AtomicU64>,
     speed_history: Arc<RwLock<VecDeque<u64>>>,
     current_speed_bps: Arc<AtomicU64>,
+    speed_limit_kbps: Arc<AtomicU64>,
+    free_disk_bytes: Arc<AtomicU64>,
     wakeup: Arc<Notify>,
     shutdown: Arc<AtomicBool>,
     history_path: PathBuf,
+    queue_path: PathBuf,
+    nzb_archive_dir: PathBuf,
 }
 
 impl DownloadEngine {
     pub fn new(config: Arc<RwLock<AppConfig>>, state_dir: PathBuf) -> Arc<Self> {
         let history_path = state_dir.join("history.json");
+        let queue_path = state_dir.join("queue.json");
+        let nzb_archive_dir = state_dir.join("nzbs");
         let loaded_history = load_history(&history_path);
+        let loaded_queue = load_queue(&queue_path);
+        let initial_speed_limit = config
+            .try_read()
+            .map(|c| c.downloads.speed_limit_kbps)
+            .unwrap_or(0);
 
         let engine = Arc::new(Self {
             config,
-            queue: Arc::new(RwLock::new(Vec::new())),
+            queue: Arc::new(RwLock::new(loaded_queue)),
             history: Arc::new(RwLock::new(loaded_history)),
             logs: Arc::new(RwLock::new(VecDeque::with_capacity(MAX_LOG_ENTRIES))),
             global_paused: Arc::new(AtomicBool::new(false)),
@@ -197,16 +221,21 @@ impl DownloadEngine {
             bytes_window: Arc::new(AtomicU64::new(0)),
             speed_history: Arc::new(RwLock::new(VecDeque::from(vec![0u64; SPEED_HISTORY_LEN]))),
             current_speed_bps: Arc::new(AtomicU64::new(0)),
+            speed_limit_kbps: Arc::new(AtomicU64::new(initial_speed_limit)),
+            free_disk_bytes: Arc::new(AtomicU64::new(u64::MAX)),
             wakeup: Arc::new(Notify::new()),
             shutdown: Arc::new(AtomicBool::new(false)),
             history_path,
+            queue_path,
+            nzb_archive_dir,
         });
 
-        // Spawn speed sampler loop (1 Hz)
+        // Spawn speed sampler + watch folder + disk space monitor loop (1 Hz)
         {
             let eng = Arc::clone(&engine);
             tokio::spawn(async move {
                 let mut tick = tokio::time::interval(Duration::from_secs(1));
+                let mut secs_elapsed: u64 = 0;
                 loop {
                     tick.tick().await;
                     if eng.shutdown.load(Ordering::Relaxed) {
@@ -222,23 +251,31 @@ impl DownloadEngine {
                         hist.push_back(bytes);
                     }
                     // Also sync live counters into queue summaries
-                    let mut q = eng.queue.write().await;
-                    for job in q.iter_mut() {
-                        if job.summary.status == JobStatus::Downloading
-                            || job.summary.status == JobStatus::DownloadingRepair
-                        {
-                            job.summary.downloaded_bytes =
-                                job.bytes_counter.load(Ordering::Relaxed);
-                            job.summary.completed_segments =
-                                job.segments_done.load(Ordering::Relaxed);
-                            job.summary.missing_segments =
-                                job.segments_missing.load(Ordering::Relaxed);
-                            job.summary.files_done = job.files_done.load(Ordering::Relaxed);
-                            job.summary.speed_bps = bytes;
-                        } else {
-                            job.summary.speed_bps = 0;
+                    {
+                        let mut q = eng.queue.write().await;
+                        for job in q.iter_mut() {
+                            if job.summary.status == JobStatus::Downloading
+                                || job.summary.status == JobStatus::DownloadingRepair
+                            {
+                                job.summary.downloaded_bytes =
+                                    job.bytes_counter.load(Ordering::Relaxed);
+                                job.summary.completed_segments =
+                                    job.segments_done.load(Ordering::Relaxed);
+                                job.summary.missing_segments =
+                                    job.segments_missing.load(Ordering::Relaxed);
+                                job.summary.files_done = job.files_done.load(Ordering::Relaxed);
+                                job.summary.speed_bps = bytes;
+                            } else {
+                                job.summary.speed_bps = 0;
+                            }
                         }
                     }
+
+                    // Every 5 seconds: check disk space & poll watch folder
+                    if secs_elapsed % 5 == 0 {
+                        eng.check_disk_and_watch_dir().await;
+                    }
+                    secs_elapsed = secs_elapsed.wrapping_add(1);
                 }
             });
         }
@@ -299,6 +336,7 @@ impl DownloadEngine {
         };
 
         let title = summary.title.clone();
+        self.archive_nzb(id, &nzb);
         self.queue.write().await.push(ManagedJob {
             summary,
             nzb,
@@ -310,6 +348,7 @@ impl DownloadEngine {
             files_done: Arc::new(AtomicUsize::new(0)),
         });
 
+        self.persist_queue().await;
         self.log(LogLevel::Info, format!("Queued NZB: {}", title))
             .await;
         self.wakeup.notify_one();
@@ -347,19 +386,24 @@ impl DownloadEngine {
     }
 
     pub async fn toggle_job_pause(&self, id: Uuid) {
-        let mut q = self.queue.write().await;
-        if let Some(job) = q.iter_mut().find(|j| j.summary.id == id) {
-            let prev = job.pause_flag.fetch_xor(true, Ordering::Relaxed);
-            let now_paused = !prev;
-            if now_paused && matches!(job.summary.status, JobStatus::Queued | JobStatus::Downloading) {
-                job.summary.status = JobStatus::Paused;
-                job.summary.stage_detail = "Paused by user".into();
-            } else if !now_paused && job.summary.status == JobStatus::Paused {
-                job.summary.status = JobStatus::Queued;
-                job.summary.stage_detail = "Resuming…".into();
-                self.wakeup.notify_one();
+        {
+            let mut q = self.queue.write().await;
+            if let Some(job) = q.iter_mut().find(|j| j.summary.id == id) {
+                let prev = job.pause_flag.fetch_xor(true, Ordering::Relaxed);
+                let now_paused = !prev;
+                if now_paused
+                    && matches!(job.summary.status, JobStatus::Queued | JobStatus::Downloading)
+                {
+                    job.summary.status = JobStatus::Paused;
+                    job.summary.stage_detail = "Paused by user".into();
+                } else if !now_paused && job.summary.status == JobStatus::Paused {
+                    job.summary.status = JobStatus::Queued;
+                    job.summary.stage_detail = "Resuming…".into();
+                    self.wakeup.notify_one();
+                }
             }
         }
+        self.persist_queue().await;
     }
 
     pub async fn cancel_job(&self, id: Uuid) {
@@ -381,28 +425,37 @@ impl DownloadEngine {
         }
         if let Some(s) = removed_summary {
             self.push_history(s).await;
+            self.persist_queue().await;
         }
     }
 
     pub async fn move_job(&self, id: Uuid, up: bool) {
-        let mut q = self.queue.write().await;
-        if let Some(pos) = q.iter().position(|j| j.summary.id == id) {
-            if up && pos > 0 {
-                q.swap(pos, pos - 1);
-            } else if !up && pos + 1 < q.len() {
-                q.swap(pos, pos + 1);
+        {
+            let mut q = self.queue.write().await;
+            if let Some(pos) = q.iter().position(|j| j.summary.id == id) {
+                if up && pos > 0 {
+                    q.swap(pos, pos - 1);
+                } else if !up && pos + 1 < q.len() {
+                    q.swap(pos, pos + 1);
+                }
             }
         }
+        self.persist_queue().await;
     }
 
     pub async fn clear_history(&self) {
+        let ids: Vec<Uuid> = self.history.read().await.iter().map(|h| h.id).collect();
         self.history.write().await.clear();
         self.persist_history().await;
+        for id in ids {
+            let _ = fs::remove_file(self.nzb_archive_dir.join(format!("{}.json", id)));
+        }
     }
 
     pub async fn remove_history_item(&self, id: Uuid) {
         self.history.write().await.retain(|h| h.id != id);
         self.persist_history().await;
+        let _ = fs::remove_file(self.nzb_archive_dir.join(format!("{}.json", id)));
     }
 
     pub async fn set_history_export_tag(&self, id: Uuid, tag: Option<String>) {
@@ -533,6 +586,137 @@ impl DownloadEngine {
         Ok(report)
     }
 
+    pub fn set_speed_limit_kbps(&self, kbps: u64) {
+        self.speed_limit_kbps.store(kbps, Ordering::Relaxed);
+    }
+
+    pub async fn retry_history_item(&self, id: Uuid) -> Result<String> {
+        let archive_path = self.nzb_archive_dir.join(format!("{}.json", id));
+        let raw = fs::read_to_string(&archive_path).map_err(|_| {
+            anyhow!("Saved NZB payload is no longer available for this history item")
+        })?;
+        let nzb: NzbDocument = serde_json::from_str(&raw)
+            .map_err(|e| anyhow!("Failed to parse saved NZB payload: {}", e))?;
+        let title = nzb.title.clone();
+        self.remove_history_item(id).await;
+        self.enqueue_nzb(nzb).await;
+        Ok(title)
+    }
+
+    async fn check_disk_and_watch_dir(&self) {
+        let cfg = self.config.read().await.clone();
+
+        // 1. Check free disk space
+        let probe_path = if cfg.downloads.download_dir.exists() {
+            cfg.downloads.download_dir.clone()
+        } else {
+            cfg.downloads.temp_dir.clone()
+        };
+        if let Ok(Some(free)) =
+            tokio::task::spawn_blocking(move || available_disk_bytes(&probe_path)).await
+        {
+            self.free_disk_bytes.store(free, Ordering::Relaxed);
+            if cfg.downloads.min_free_disk_mb > 0 {
+                let threshold = cfg.downloads.min_free_disk_mb.saturating_mul(1024 * 1024);
+                if free < threshold && !self.global_paused.load(Ordering::Relaxed) {
+                    self.global_paused.store(true, Ordering::Relaxed);
+                    self.log(
+                        LogLevel::Warn,
+                        format!(
+                            "Low disk space ({} free < {} MiB limit) — pausing all downloads",
+                            format_bytes(free),
+                            cfg.downloads.min_free_disk_mb
+                        ),
+                    )
+                    .await;
+                }
+            }
+        }
+
+        // 2. Poll watch_dir for *.nzb files
+        if let Some(ref watch_dir) = cfg.downloads.watch_dir {
+            if watch_dir.is_dir() {
+                let wd = watch_dir.clone();
+                let nzb_paths = tokio::task::spawn_blocking(move || {
+                    let mut out = Vec::new();
+                    if let Ok(entries) = fs::read_dir(&wd) {
+                        for entry in entries.flatten() {
+                            let p = entry.path();
+                            if p.is_file()
+                                && p.extension()
+                                    .and_then(|e| e.to_str())
+                                    .map(|e| e.eq_ignore_ascii_case("nzb"))
+                                    .unwrap_or(false)
+                            {
+                                out.push(p);
+                            }
+                        }
+                    }
+                    out
+                })
+                .await
+                .unwrap_or_default();
+
+                for path in nzb_paths {
+                    match self.enqueue_local_file(&path).await {
+                        Ok((_, title)) => {
+                            let imported_path = path.with_extension("nzb.imported");
+                            let _ = fs::rename(&path, &imported_path);
+                            self.log(
+                                LogLevel::Info,
+                                format!("Watch folder imported: {} ({})", title, path.display()),
+                            )
+                            .await;
+                        }
+                        Err(err) => {
+                            let failed_path = path.with_extension("nzb.failed");
+                            let _ = fs::rename(&path, &failed_path);
+                            self.log(
+                                LogLevel::Error,
+                                format!("Watch folder failed {}: {}", path.display(), err),
+                            )
+                            .await;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn archive_nzb(&self, id: Uuid, nzb: &NzbDocument) {
+        let dir = self.nzb_archive_dir.clone();
+        let path = dir.join(format!("{}.json", id));
+        if let Ok(json) = serde_json::to_string(nzb) {
+            let _ = fs::create_dir_all(&dir);
+            let _ = fs::write(path, json);
+        }
+    }
+
+    async fn persist_queue(&self) {
+        let items: Vec<PersistedQueueItem> = {
+            let q = self.queue.read().await;
+            q.iter()
+                .map(|j| PersistedQueueItem {
+                    summary: j.summary.clone(),
+                    nzb: j.nzb.clone(),
+                })
+                .collect()
+        };
+        let path = self.queue_path.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Some(parent) = path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            if let Ok(json) = serde_json::to_string_pretty(&PersistedQueue { queue: items }) {
+                let tmp = path.with_extension("json.tmp");
+                if fs::write(&tmp, json).is_ok() {
+                    let _ = fs::rename(&tmp, &path);
+                }
+            }
+        })
+        .await;
+    }
+
     pub async fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Relaxed);
         let q = self.queue.read().await;
@@ -571,6 +755,13 @@ impl DownloadEngine {
                 .sum()
         };
 
+        let raw_free = self.free_disk_bytes.load(Ordering::Relaxed);
+        let free_disk_bytes = if raw_free == u64::MAX {
+            None
+        } else {
+            Some(raw_free)
+        };
+
         EngineSnapshot {
             queue,
             history,
@@ -579,6 +770,8 @@ impl DownloadEngine {
             speed_history,
             active_connections: self.active_connections.load(Ordering::Relaxed),
             max_connections,
+            speed_limit_kbps: self.speed_limit_kbps.load(Ordering::Relaxed),
+            free_disk_bytes,
             logs,
         }
     }
@@ -1001,6 +1194,7 @@ impl DownloadEngine {
                 let shutdown = Arc::clone(&self.shutdown);
                 let bytes_counter = Arc::clone(bytes_counter);
                 let bytes_window = Arc::clone(&self.bytes_window);
+                let speed_limit_kbps = Arc::clone(&self.speed_limit_kbps);
                 let segments_done = Arc::clone(segments_done);
                 let segments_missing = Arc::clone(segments_missing);
                 let target_path = Arc::clone(&target_path);
@@ -1026,6 +1220,23 @@ impl DownloadEngine {
                                 return;
                             }
                             tokio::time::sleep(Duration::from_millis(200)).await;
+                        }
+
+                        loop {
+                            let limit_kbps = speed_limit_kbps.load(Ordering::Relaxed);
+                            if limit_kbps == 0 {
+                                break;
+                            }
+                            let limit_bps = limit_kbps.saturating_mul(1024);
+                            if bytes_window.load(Ordering::Relaxed) < limit_bps {
+                                break;
+                            }
+                            if cancel_flag.load(Ordering::Relaxed)
+                                || shutdown.load(Ordering::Relaxed)
+                            {
+                                return;
+                            }
+                            tokio::time::sleep(Duration::from_millis(50)).await;
                         }
 
                         let seg = {
@@ -1169,7 +1380,8 @@ impl DownloadEngine {
             }
         };
 
-        if let Some(summary) = finished {
+        if let Some(mut summary) = finished {
+            self.persist_queue().await;
             if status == JobStatus::Failed {
                 self.log(
                     LogLevel::Error,
@@ -1181,7 +1393,35 @@ impl DownloadEngine {
                 )
                 .await;
             }
+
+            let mut auto_export_dest: Option<PathBuf> = None;
+            if status == JobStatus::Completed {
+                let cfg = self.config.read().await;
+                if summary.export_tag.is_none() {
+                    if let Some(target) =
+                        cfg.match_export_target_for_category(summary.category.as_deref())
+                    {
+                        summary.export_tag = Some(target.tag.clone());
+                    }
+                }
+                if cfg.downloads.auto_export {
+                    if let Some(tag) = summary.export_tag.as_deref() {
+                        auto_export_dest = cfg.export_path_for_tag(tag).cloned();
+                    }
+                }
+            }
+
             self.push_history(summary).await;
+
+            if let Some(dest_dir) = auto_export_dest {
+                if let Err(err) = self.export_history_item(job_id, &dest_dir, true).await {
+                    self.log(
+                        LogLevel::Warn,
+                        format!("Auto-export failed: {}", err),
+                    )
+                    .await;
+                }
+            }
         }
     }
 }
@@ -1282,6 +1522,58 @@ fn load_history(path: &Path) -> Vec<JobSummary> {
     serde_json::from_str::<PersistedHistory>(&raw)
         .map(|h| h.history)
         .unwrap_or_default()
+}
+
+fn load_queue(path: &Path) -> Vec<ManagedJob> {
+    let Ok(raw) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let Ok(parsed) = serde_json::from_str::<PersistedQueue>(&raw) else {
+        return Vec::new();
+    };
+    parsed
+        .queue
+        .into_iter()
+        .map(|item| {
+            let mut summary = item.summary;
+            let is_paused = summary.status == JobStatus::Paused;
+            if !is_paused {
+                summary.status = JobStatus::Queued;
+                summary.stage_detail = "Restored from previous session".to_string();
+            }
+            summary.speed_bps = 0;
+            ManagedJob {
+                summary,
+                nzb: item.nzb,
+                cancel_flag: Arc::new(AtomicBool::new(false)),
+                pause_flag: Arc::new(AtomicBool::new(is_paused)),
+                bytes_counter: Arc::new(AtomicU64::new(0)),
+                segments_done: Arc::new(AtomicUsize::new(0)),
+                segments_missing: Arc::new(AtomicUsize::new(0)),
+                files_done: Arc::new(AtomicUsize::new(0)),
+            }
+        })
+        .collect()
+}
+
+fn available_disk_bytes(path: &Path) -> Option<u64> {
+    let target = if path.exists() {
+        path
+    } else {
+        path.parent()?
+    };
+    let out = std::process::Command::new("df")
+        .arg("-Pk")
+        .arg(target)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let data_line = stdout.lines().nth(1)?;
+    let avail_kb: u64 = data_line.split_whitespace().nth(3)?.parse().ok()?;
+    Some(avail_kb.saturating_mul(1024))
 }
 
 pub fn format_bytes(bytes: u64) -> String {

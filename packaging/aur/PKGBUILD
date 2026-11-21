@@ -1,0 +1,45 @@
+# Maintainer: Derrik Diener <142091676+soltros@users.noreply.github.com>
+pkgname=nzbtui
+pkgver=0.4.0
+pkgrel=1
+pkgdesc="Standalone Rust TUI Usenet client built with Ratatui"
+arch=('x86_64' 'aarch64')
+url="https://github.com/soltros/nzbtui"
+license=('GPL-3.0-or-later')
+depends=('glibc' 'gcc-libs')
+makedepends=('cargo')
+optdepends=(
+  'par2cmdline: PAR2 verification and repair'
+  'unrar: RAR archive extraction'
+  'p7zip: 7z archive extraction'
+  'unzip: ZIP archive extraction'
+)
+source=("${pkgname}-${pkgver}.tar.gz::https://github.com/soltros/nzbtui/archive/refs/tags/v${pkgver}.tar.gz")
+sha256sums=('SKIP')
+
+prepare() {
+  cd "${srcdir}/${pkgname}-${pkgver}"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "${srcdir}/${pkgname}-${pkgver}"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo build --frozen --release --all-features
+}
+
+check() {
+  cd "${srcdir}/${pkgname}-${pkgver}"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo test --frozen --all-features
+}
+
+package() {
+  cd "${srcdir}/${pkgname}-${pkgver}"
+  install -Dm755 "target/release/${pkgname}" "${pkgdir}/usr/bin/${pkgname}"
+  install -Dm644 "debian/${pkgname}.1" "${pkgdir}/usr/share/man/man1/${pkgname}.1"
+  install -Dm644 "README.md" "${pkgdir}/usr/share/doc/${pkgname}/README.md"
+  install -Dm644 "LICENSE" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+}

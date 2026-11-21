@@ -114,11 +114,25 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         ),
     ]);
 
+    let status_title = match (
+        app.snapshot.speed_limit_kbps > 0,
+        app.snapshot.free_disk_bytes,
+    ) {
+        (true, Some(free)) => format!(
+            " Status (cap {} KB/s | {} free) ",
+            app.snapshot.speed_limit_kbps,
+            format_bytes(free)
+        ),
+        (true, None) => format!(" Status (cap {} KB/s) ", app.snapshot.speed_limit_kbps),
+        (false, Some(free)) => format!(" Status ({} free) ", format_bytes(free)),
+        (false, None) => " Status ".to_string(),
+    };
+
     let status_widget = Paragraph::new(status_line).block(
         Block::default()
             .borders(Borders::ALL)
             .border_style(theme::border())
-            .title(Span::styled(" Status ", theme::subtext())),
+            .title(Span::styled(status_title, theme::subtext())),
     );
     frame.render_widget(status_widget, chunks[1]);
 }
@@ -133,11 +147,12 @@ fn draw_search(frame: &mut Frame, app: &App, area: Rect) {
     let bar_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Min(24),
-            Constraint::Length(16),
-            Constraint::Length(16),
-            Constraint::Length(18),
+            Constraint::Min(20),
+            Constraint::Length(14),
+            Constraint::Length(14),
             Constraint::Length(12),
+            Constraint::Length(16),
+            Constraint::Length(11),
         ])
         .split(chunks[0]);
 
@@ -217,6 +232,28 @@ fn draw_search(frame: &mut Frame, app: &App, area: Rect) {
         );
     frame.render_widget(season_box, bar_chunks[2]);
 
+    let ep_label = if app.search_episode.trim().is_empty() {
+        "All".to_string()
+    } else {
+        format!("E{}", app.search_episode.trim())
+    };
+    let ep_style = if app.search_episode.trim().is_empty() {
+        Style::default().fg(theme::TEXT)
+    } else {
+        Style::default()
+            .fg(theme::ACCENT)
+            .add_modifier(Modifier::BOLD)
+    };
+    let ep_box = Paragraph::new(ep_label)
+        .style(ep_style)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(theme::border())
+                .title(Span::styled(" Ep [E] ", theme::subtext())),
+        );
+    frame.render_widget(ep_box, bar_chunks[3]);
+
     let idx_box = Paragraph::new(app.current_indexer_filter_label())
         .style(Style::default().fg(theme::TEXT))
         .block(
@@ -225,7 +262,7 @@ fn draw_search(frame: &mut Frame, app: &App, area: Rect) {
                 .border_style(theme::border())
                 .title(Span::styled(" Indexer [i] ", theme::subtext())),
         );
-    frame.render_widget(idx_box, bar_chunks[3]);
+    frame.render_widget(idx_box, bar_chunks[4]);
 
     let sort_box = Paragraph::new(app.search_sort.label())
         .style(Style::default().fg(theme::TEXT))
@@ -235,7 +272,7 @@ fn draw_search(frame: &mut Frame, app: &App, area: Rect) {
                 .border_style(theme::border())
                 .title(Span::styled(" Sort [o] ", theme::subtext())),
         );
-    frame.render_widget(sort_box, bar_chunks[4]);
+    frame.render_widget(sort_box, bar_chunks[5]);
 
     // Results table
     if app.search_results.is_empty() {
@@ -269,6 +306,8 @@ fn draw_search(frame: &mut Frame, app: &App, area: Rect) {
         .map(|item| {
             let queued_prefix = if app.queued_guids.contains(&item.guid) {
                 "[✓] "
+            } else if app.search_marked.contains(&item.guid) {
+                "[*] "
             } else if item.password_protected {
                 "[🔒] "
             } else {
@@ -277,6 +316,10 @@ fn draw_search(frame: &mut Frame, app: &App, area: Rect) {
             let title_text = format!("{}{}", queued_prefix, item.title);
             let title_style = if app.queued_guids.contains(&item.guid) {
                 theme::success()
+            } else if app.search_marked.contains(&item.guid) {
+                Style::default()
+                    .fg(theme::ACCENT)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(theme::TEXT)
             };
@@ -314,8 +357,10 @@ fn draw_search(frame: &mut Frame, app: &App, area: Rect) {
             })
             .title(Span::styled(
                 format!(
-                    " Results ({}) — [Enter/d] Download  [I] Import .nzb ",
-                    app.search_results.len()
+                    " Results ({}, offset {}, {} marked) — [Space] Mark  [Enter/d] Queue  [[/]] Page ",
+                    app.search_results.len(),
+                    app.search_offset,
+                    app.search_marked.len()
                 ),
                 theme::title(),
             )),
@@ -497,7 +542,7 @@ fn draw_downloads(frame: &mut Frame, app: &App, area: Rect) {
             })
             .title(Span::styled(
                 format!(
-                    " History ({}) — [Enter] Details  [x] Remove  [c] Cleanup  [C] Clear All ",
+                    " History ({}) — [Enter] Details  [r] Retry  [o] Open  [x] Remove  [c] Cleanup  [C] Clear All ",
                     app.snapshot.history.len()
                 ),
                 if hist_focused {
@@ -753,6 +798,23 @@ fn draw_general_settings(frame: &mut Frame, app: &App, area: Rect) {
         .split(area);
 
     let pp = &app.config.downloads.post_process;
+    let watch_val = app
+        .config
+        .downloads
+        .watch_dir
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "Disabled".to_string());
+    let speed_val = if app.config.downloads.speed_limit_kbps == 0 {
+        "Unlimited".to_string()
+    } else {
+        format!("{} KB/s", app.config.downloads.speed_limit_kbps)
+    };
+    let disk_val = if app.config.downloads.min_free_disk_mb == 0 {
+        "Disabled".to_string()
+    } else {
+        format!("{} MiB", app.config.downloads.min_free_disk_mb)
+    };
     let items: Vec<(&str, String)> = vec![
         (
             "Download Directory",
@@ -762,9 +824,16 @@ fn draw_general_settings(frame: &mut Frame, app: &App, area: Rect) {
             "Incomplete / Temp Directory",
             app.config.downloads.temp_dir.display().to_string(),
         ),
+        ("Watch Folder (.nzb auto-import)", watch_val),
         (
             "Max Concurrent Jobs",
             app.config.downloads.max_concurrent_jobs.to_string(),
+        ),
+        ("Speed Limit", speed_val),
+        ("Min Free Disk Space Guard", disk_val),
+        (
+            "Auto-Export Tagged Downloads",
+            bool_badge(app.config.downloads.auto_export),
         ),
         ("Verify PAR2 Checksums", bool_badge(pp.verify_par2)),
         (
@@ -986,8 +1055,9 @@ fn draw_export(frame: &mut Frame, app: &App, area: Rect) {
 
     let items = app.export_items();
     let title = format!(
-        " Download Export ({}) — [t] Cycle Tag  [e/Enter] Export  [E] Export All Tagged  [m] Move/Copy ",
-        items.len()
+        " Download Export ({}, {} marked) — [Space] Mark  [t] Tag  [e/Enter] Export  [E] Export All  [o] Open  [m] Move/Copy ",
+        items.len(),
+        app.export_marked.len()
     );
 
     if items.is_empty() {
@@ -1064,9 +1134,15 @@ fn draw_export(frame: &mut Frame, app: &App, area: Rect) {
                     .unwrap_or_else(|| "-".to_string())
             };
 
+            let title_cell = if app.export_marked.contains(&job.id) {
+                format!("[*] {}", job.title)
+            } else {
+                job.title.clone()
+            };
+
             Row::new(vec![
                 Cell::from(state_label).style(state_style),
-                Cell::from(job.title.clone()).style(Style::default().fg(theme::TEXT)),
+                Cell::from(title_cell).style(Style::default().fg(theme::TEXT)),
                 Cell::from(format_bytes(job.total_bytes)).style(theme::subtext()),
                 Cell::from(tag_cell).style(tag_style),
                 Cell::from(dest_cell).style(theme::subtext()),
@@ -1121,17 +1197,17 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         let hint = match app.active_tab {
             ActiveTab::Search => {
-                " [/] Search  [c] Cat  [S] Season  [i] Indexer  [o] Sort  [Enter/d] Download  [I] Import .nzb "
+                " [/] Search  [c] Cat  [S] Season  [E] Ep  [[/]] Page  [Space] Mark  [Enter/d] Queue "
             }
             ActiveTab::Downloads => {
-                " [Space] Pause Job  [P] Pause All  [x] Cancel  [c] Cleanup  [K/J] Move  [w] Switch Pane  [Enter] Details "
+                " [Space] Pause  [P] Pause All  [B] Speed Cap  [r] Retry  [o] Open  [c] Cleanup  [x] Cancel "
             }
             ActiveTab::Settings => {
                 " [h/l] Switch Section  [a] Add  [e] Edit  [t] Test  [Space] Toggle  [d] Delete "
             }
             ActiveTab::Logs => " [j/k] Scroll  [G] Bottom  [a] Toggle Auto-Scroll ",
             ActiveTab::Export => {
-                " [t] Cycle Tag  [e/Enter] Export Selected  [E] Export All Tagged  [m] Move/Copy "
+                " [Space] Mark  [t] Tag  [e/Enter] Export  [E] Export All  [o] Open  [m] Move/Copy "
             }
         };
         frame.render_widget(Paragraph::new(hint).style(theme::subtext()), chunks[0]);
@@ -1144,6 +1220,8 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled(" Import NZB  ", theme::muted()),
         Span::styled("[P]", Style::default().fg(theme::ACCENT)),
         Span::styled(" Global Pause  ", theme::muted()),
+        Span::styled("[U]", Style::default().fg(theme::ACCENT)),
+        Span::styled(" Update  ", theme::muted()),
         Span::styled("[?]", Style::default().fg(theme::ACCENT)),
         Span::styled(" Help  ", theme::muted()),
         Span::styled("[q]", Style::default().fg(theme::ACCENT)),
@@ -1431,27 +1509,26 @@ fn draw_job_details_modal(frame: &mut Frame, job: &JobSummary, area: Rect) {
 }
 
 fn draw_help_modal(frame: &mut Frame, area: Rect) {
-    let popup = centered_rect(70, 27, area);
+    let popup = centered_rect(72, 29, area);
     frame.render_widget(Clear, popup);
 
     let lines = vec![
         Line::from(Span::styled(" Global Keys", theme::title())),
         Line::from("   1 / 2 / 3 / 4 / 5   Jump to Search / Downloads / Settings / Logs / Export"),
-        Line::from("   Tab / Shift+Tab     Cycle views"),
-        Line::from("   I                   Import a local .nzb file"),
+        Line::from("   Tab / Shift+Tab     Cycle through all views & sub-panes"),
+        Line::from("   I / U               Import local .nzb | Check & install update"),
         Line::from("   P                   Pause / resume all downloads"),
         Line::from("   ? / q / Ctrl+C      Help / Quit"),
         Line::from(""),
         Line::from(Span::styled(" Search View", theme::title())),
         Line::from("   / or s              Focus search bar (Enter to run, Esc to blur)"),
-        Line::from("   c / C               Cycle Newznab category filter"),
-        Line::from("   S                   Filter by season (00 = full season packs)"),
-        Line::from("   i / o               Cycle indexer filter / sort order"),
-        Line::from("   Enter or d          Fetch NZB and enqueue download"),
+        Line::from("   c / C | S / E       Cycle category | Filter by Season (00=packs) / Episode"),
+        Line::from("   [ / ] | i / o       Prev/Next results page | Cycle indexer / sort order"),
+        Line::from("   Space | Enter / d   Mark multiple | Queue selected or marked NZBs"),
         Line::from(""),
         Line::from(Span::styled(" Downloads View", theme::title())),
-        Line::from("   Space / p           Pause or resume selected job"),
-        Line::from("   x / Delete          Cancel active job or remove history item"),
+        Line::from("   Space / p | B       Pause or resume job | Set download speed limit"),
+        Line::from("   x / Delete | r | o  Cancel/Remove | Retry failed | Open output folder"),
         Line::from("   K / J               Move queued job priority up / down"),
         Line::from("   w / Enter           Switch Queue/History | Details"),
         Line::from("   c / C               Cleanup failed & temp dirs | Clear all history"),
@@ -1459,7 +1536,7 @@ fn draw_help_modal(frame: &mut Frame, area: Rect) {
         Line::from(Span::styled(" Settings & Export Views", theme::title())),
         Line::from("   h / l               Switch Providers / Indexers / General / Export Targets"),
         Line::from("   a / e / d / t       Add / Edit / Delete / Live Test Connection"),
-        Line::from("   t / e / E / m       Export: Cycle Tag / Export / Export All / Move-Copy"),
+        Line::from("   Space / t / e / E   Export: Mark / Tag / Export / Export All / [o] Open / [m] Mode"),
     ];
 
     let widget = Paragraph::new(lines).block(

@@ -33,26 +33,6 @@ impl ActiveTab {
             ActiveTab::Export => 4,
         }
     }
-
-    pub fn next(self) -> Self {
-        match self {
-            ActiveTab::Search => ActiveTab::Downloads,
-            ActiveTab::Downloads => ActiveTab::Settings,
-            ActiveTab::Settings => ActiveTab::Logs,
-            ActiveTab::Logs => ActiveTab::Export,
-            ActiveTab::Export => ActiveTab::Search,
-        }
-    }
-
-    pub fn prev(self) -> Self {
-        match self {
-            ActiveTab::Search => ActiveTab::Export,
-            ActiveTab::Downloads => ActiveTab::Search,
-            ActiveTab::Settings => ActiveTab::Downloads,
-            ActiveTab::Logs => ActiveTab::Settings,
-            ActiveTab::Export => ActiveTab::Logs,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -252,9 +232,13 @@ impl IndexerForm {
 pub enum TextPromptKind {
     ImportNzb,
     SearchSeason,
+    SearchEpisode,
     DownloadDir,
     TempDir,
+    WatchDir,
     MaxConcurrentJobs,
+    SpeedLimit,
+    MinFreeDiskMb,
 }
 
 #[derive(Debug, Clone)]
@@ -343,6 +327,7 @@ pub enum AsyncEvent {
         detail: String,
     },
     LocalImportResult(Result<String, String>),
+    UpdateResult(Result<String, String>),
 }
 
 pub struct ToolStatus {
@@ -381,6 +366,8 @@ pub struct App {
     pub search_input_focused: bool,
     pub search_category_idx: usize,
     pub search_season: String,
+    pub search_episode: String,
+    pub search_offset: usize,
     /// 0 = All Enabled Indexers, 1..=N = specific indexer
     pub search_indexer_idx: usize,
     pub search_sort: SearchSort,
@@ -388,6 +375,7 @@ pub struct App {
     pub search_results: Vec<SearchResult>,
     pub search_selected: usize,
     pub queued_guids: HashSet<String>,
+    pub search_marked: HashSet<String>,
 
     // Downloads state
     pub downloads_pane: DownloadsPane,
@@ -409,6 +397,7 @@ pub struct App {
     // Export state
     pub export_selected: usize,
     pub export_move_mode: bool,
+    pub export_marked: HashSet<uuid::Uuid>,
 
     // Overlays
     pub modal: Option<Modal>,
@@ -452,12 +441,15 @@ impl App {
             search_input_focused: false,
             search_category_idx: 0,
             search_season: String::new(),
+            search_episode: String::new(),
+            search_offset: 0,
             search_indexer_idx: 0,
             search_sort: SearchSort::DateDesc,
             search_loading: false,
             search_results: Vec::new(),
             search_selected: 0,
             queued_guids: HashSet::new(),
+            search_marked: HashSet::new(),
 
             downloads_pane: DownloadsPane::Queue,
             queue_selected: 0,
@@ -475,6 +467,7 @@ impl App {
 
             export_selected: 0,
             export_move_mode: true,
+            export_marked: HashSet::new(),
 
             modal: None,
             toast: None,
@@ -572,6 +565,18 @@ impl App {
                     Ok(title) => self.set_toast(format!("Imported NZB: {}", title), false),
                     Err(e) => self.set_toast(format!("Import failed: {}", e), true),
                 },
+                AsyncEvent::UpdateResult(res) => match res {
+                    Ok(msg) => {
+                        self.engine.log(LogLevel::Success, msg.clone()).await;
+                        self.set_toast(msg, false);
+                    }
+                    Err(e) => {
+                        self.engine
+                            .log(LogLevel::Error, format!("Update check failed: {}", e))
+                            .await;
+                        self.set_toast(e, true);
+                    }
+                },
             }
         }
     }
@@ -594,6 +599,14 @@ impl App {
             match key.code {
                 KeyCode::Esc => {
                     self.search_input_focused = false;
+                }
+                KeyCode::Tab => {
+                    self.search_input_focused = false;
+                    self.cycle_tab_forward();
+                }
+                KeyCode::BackTab => {
+                    self.search_input_focused = false;
+                    self.cycle_tab_backward();
                 }
                 KeyCode::Enter => {
                     self.search_input_focused = false;
@@ -644,11 +657,15 @@ impl App {
                 return;
             }
             KeyCode::Tab => {
-                self.active_tab = self.active_tab.next();
+                self.cycle_tab_forward();
                 return;
             }
             KeyCode::BackTab => {
-                self.active_tab = self.active_tab.prev();
+                self.cycle_tab_backward();
+                return;
+            }
+            KeyCode::Char('U') => {
+                self.trigger_self_update();
                 return;
             }
             KeyCode::Char('I') => {
@@ -708,6 +725,37 @@ impl App {
                     value: self.search_season.clone(),
                 }));
             }
+            KeyCode::Char('E') => {
+                self.modal = Some(Modal::TextPrompt(TextPrompt {
+                    kind: TextPromptKind::SearchEpisode,
+                    title: "Filter by Episode".into(),
+                    hint: "Episode number (e.g. 1, 05, or leave empty for All)".into(),
+                    value: self.search_episode.clone(),
+                }));
+            }
+            KeyCode::Char(']') => {
+                self.search_offset = self.search_offset.saturating_add(self.config.ui.search_limit);
+                self.trigger_search_with_offset(false);
+            }
+            KeyCode::Char('[') => {
+                if self.search_offset > 0 {
+                    self.search_offset = self
+                        .search_offset
+                        .saturating_sub(self.config.ui.search_limit);
+                    self.trigger_search_with_offset(false);
+                }
+            }
+            KeyCode::Char(' ') => {
+                if let Some(item) = self.search_results.get(self.search_selected) {
+                    let guid = item.guid.clone();
+                    if !self.search_marked.remove(&guid) {
+                        self.search_marked.insert(guid);
+                    }
+                    if self.search_selected + 1 < self.search_results.len() {
+                        self.search_selected += 1;
+                    }
+                }
+            }
             KeyCode::Char('i') => {
                 let count = self.config.enabled_indexers().len() + 1;
                 self.search_indexer_idx = (self.search_indexer_idx + 1) % count.max(1);
@@ -738,7 +786,7 @@ impl App {
                 self.search_selected = self.search_selected.saturating_sub(10);
             }
             KeyCode::Enter | KeyCode::Char('d') => {
-                self.download_selected_search_result();
+                self.download_selected_or_marked_search_results();
             }
             _ => {}
         }
@@ -812,6 +860,41 @@ impl App {
                         }
                     }
                 }
+            }
+            KeyCode::Char('r') => {
+                if self.downloads_pane == DownloadsPane::History {
+                    if let Some(job) = self.snapshot.history.get(self.history_selected).cloned() {
+                        match self.engine.retry_history_item(job.id).await {
+                            Ok(title) => {
+                                self.snapshot = self.engine.snapshot().await;
+                                self.set_toast(format!("Re-queued: {}", title), false);
+                            }
+                            Err(err) => {
+                                self.set_toast(format!("Retry failed: {}", err), true);
+                            }
+                        }
+                    }
+                }
+            }
+            KeyCode::Char('o') => {
+                if self.downloads_pane == DownloadsPane::History {
+                    if let Some(path) = self
+                        .snapshot
+                        .history
+                        .get(self.history_selected)
+                        .and_then(|j| j.output_path.clone())
+                    {
+                        self.open_in_file_manager(&path);
+                    }
+                }
+            }
+            KeyCode::Char('B') => {
+                self.modal = Some(Modal::TextPrompt(TextPrompt {
+                    kind: TextPromptKind::SpeedLimit,
+                    title: "Speed Limit (KB/s)".into(),
+                    hint: "Max download speed in KB/s (0 = unlimited)".into(),
+                    value: self.config.downloads.speed_limit_kbps.to_string(),
+                }));
             }
             KeyCode::Char('c') => match self.engine.cleanup_downloads().await {
                 Ok(report) => {
@@ -1004,7 +1087,7 @@ impl App {
                 _ => {}
             },
             SettingsSection::General => {
-                const GENERAL_ITEMS: usize = 8;
+                const GENERAL_ITEMS: usize = 12;
                 match key.code {
                     KeyCode::Down | KeyCode::Char('j') => {
                         self.general_selected = (self.general_selected + 1).min(GENERAL_ITEMS - 1);
@@ -1031,33 +1114,69 @@ impl App {
                         }
                         2 => {
                             self.modal = Some(Modal::TextPrompt(TextPrompt {
+                                kind: TextPromptKind::WatchDir,
+                                title: "Watch Folder (.nzb auto-import)".into(),
+                                hint: "Directory to watch for .nzb files (leave empty to disable)"
+                                    .into(),
+                                value: self
+                                    .config
+                                    .downloads
+                                    .watch_dir
+                                    .as_ref()
+                                    .map(|p| p.display().to_string())
+                                    .unwrap_or_default(),
+                            }));
+                        }
+                        3 => {
+                            self.modal = Some(Modal::TextPrompt(TextPrompt {
                                 kind: TextPromptKind::MaxConcurrentJobs,
                                 title: "Max Concurrent Jobs".into(),
                                 hint: "Number of NZBs downloading simultaneously (1-8)".into(),
                                 value: self.config.downloads.max_concurrent_jobs.to_string(),
                             }));
                         }
-                        3 => {
+                        4 => {
+                            self.modal = Some(Modal::TextPrompt(TextPrompt {
+                                kind: TextPromptKind::SpeedLimit,
+                                title: "Speed Limit (KB/s)".into(),
+                                hint: "Max download speed in KB/s (0 = unlimited)".into(),
+                                value: self.config.downloads.speed_limit_kbps.to_string(),
+                            }));
+                        }
+                        5 => {
+                            self.modal = Some(Modal::TextPrompt(TextPrompt {
+                                kind: TextPromptKind::MinFreeDiskMb,
+                                title: "Min Free Disk Space (MiB)".into(),
+                                hint: "Auto-pause queue below this free space in MiB (0 = off)"
+                                    .into(),
+                                value: self.config.downloads.min_free_disk_mb.to_string(),
+                            }));
+                        }
+                        6 => {
+                            self.config.downloads.auto_export = !self.config.downloads.auto_export;
+                            self.persist_config().await;
+                        }
+                        7 => {
                             self.config.downloads.post_process.verify_par2 =
                                 !self.config.downloads.post_process.verify_par2;
                             self.persist_config().await;
                         }
-                        4 => {
+                        8 => {
                             self.config.downloads.post_process.repair_par2 =
                                 !self.config.downloads.post_process.repair_par2;
                             self.persist_config().await;
                         }
-                        5 => {
+                        9 => {
                             self.config.downloads.post_process.extract_archives =
                                 !self.config.downloads.post_process.extract_archives;
                             self.persist_config().await;
                         }
-                        6 => {
+                        10 => {
                             self.config.downloads.post_process.cleanup_after_extract =
                                 !self.config.downloads.post_process.cleanup_after_extract;
                             self.persist_config().await;
                         }
-                        7 => {
+                        11 => {
                             self.config.downloads.post_process.create_job_subfolder =
                                 !self.config.downloads.post_process.create_job_subfolder;
                             self.persist_config().await;
@@ -1153,6 +1272,27 @@ impl App {
                     false,
                 );
             }
+            KeyCode::Char(' ') => {
+                if let Some(job) = self.export_items().get(self.export_selected) {
+                    let id = job.id;
+                    if !self.export_marked.remove(&id) {
+                        self.export_marked.insert(id);
+                    }
+                    if self.export_selected + 1 < items_len {
+                        self.export_selected += 1;
+                    }
+                }
+            }
+            KeyCode::Char('o') => {
+                if let Some(path) = self
+                    .export_items()
+                    .get(self.export_selected)
+                    .and_then(|job| job.exported_to.as_ref().or(job.output_path.as_ref()))
+                    .cloned()
+                {
+                    self.open_in_file_manager(&path);
+                }
+            }
             KeyCode::Char('t') => {
                 if self.config.export_targets.is_empty() {
                     self.set_toast(
@@ -1161,11 +1301,11 @@ impl App {
                     );
                     return;
                 }
-                let Some(job) = self.export_items().get(self.export_selected).cloned().cloned()
+                let Some(anchor) = self.export_items().get(self.export_selected).cloned().cloned()
                 else {
                     return;
                 };
-                let next_tag = match job.export_tag.as_deref() {
+                let next_tag = match anchor.export_tag.as_deref() {
                     None => Some(self.config.export_targets[0].tag.clone()),
                     Some(current) => {
                         let idx = self
@@ -1181,14 +1321,67 @@ impl App {
                         }
                     }
                 };
-                self.engine
-                    .set_history_export_tag(job.id, next_tag.clone())
-                    .await;
+                let target_ids: Vec<uuid::Uuid> = if !self.export_marked.is_empty() {
+                    self.export_marked.iter().copied().collect()
+                } else {
+                    vec![anchor.id]
+                };
+                let count = target_ids.len();
+                for id in target_ids {
+                    self.engine
+                        .set_history_export_tag(id, next_tag.clone())
+                        .await;
+                }
                 self.snapshot = self.engine.snapshot().await;
                 let label = next_tag.unwrap_or_else(|| "(untagged)".to_string());
-                self.set_toast(format!("Tagged '{}' as {}", job.title, label), false);
+                if count > 1 {
+                    self.set_toast(format!("Tagged {} items as {}", count, label), false);
+                } else {
+                    self.set_toast(format!("Tagged '{}' as {}", anchor.title, label), false);
+                }
             }
             KeyCode::Char('e') | KeyCode::Enter => {
+                if !self.export_marked.is_empty() {
+                    let marked_ids: Vec<uuid::Uuid> = self.export_marked.iter().copied().collect();
+                    let items: Vec<JobSummary> = self
+                        .export_items()
+                        .into_iter()
+                        .filter(|j| marked_ids.contains(&j.id))
+                        .cloned()
+                        .collect();
+                    let mut ok_count = 0usize;
+                    let mut err_count = 0usize;
+                    for job in items {
+                        if let Some(dest_dir) = job
+                            .export_tag
+                            .as_deref()
+                            .and_then(|t| self.config.export_path_for_tag(t))
+                            .cloned()
+                        {
+                            match self
+                                .engine
+                                .export_history_item(job.id, &dest_dir, self.export_move_mode)
+                                .await
+                            {
+                                Ok(_) => ok_count += 1,
+                                Err(_) => err_count += 1,
+                            }
+                        } else {
+                            err_count += 1;
+                        }
+                    }
+                    self.export_marked.clear();
+                    self.snapshot = self.engine.snapshot().await;
+                    self.set_toast(
+                        format!(
+                            "Exported marked: {} succeeded, {} failed",
+                            ok_count, err_count
+                        ),
+                        err_count > 0,
+                    );
+                    return;
+                }
+
                 let Some(job) = self.export_items().get(self.export_selected).cloned().cloned()
                 else {
                     return;
@@ -1486,6 +1679,19 @@ impl App {
                                     );
                                 }
                             }
+                            TextPromptKind::SearchEpisode => {
+                                self.search_episode = val;
+                                if !self.config.enabled_indexers().is_empty() {
+                                    self.trigger_search();
+                                } else if self.search_episode.is_empty() {
+                                    self.set_toast("Episode filter cleared (All)", false);
+                                } else {
+                                    self.set_toast(
+                                        format!("Episode filter set to '{}'", self.search_episode),
+                                        false,
+                                    );
+                                }
+                            }
                             TextPromptKind::DownloadDir => {
                                 if !val.is_empty() {
                                     self.config.downloads.download_dir =
@@ -1500,6 +1706,14 @@ impl App {
                                     self.persist_config().await;
                                 }
                             }
+                            TextPromptKind::WatchDir => {
+                                self.config.downloads.watch_dir = if val.is_empty() {
+                                    None
+                                } else {
+                                    Some(expand_tilde(&PathBuf::from(val)))
+                                };
+                                self.persist_config().await;
+                            }
                             TextPromptKind::MaxConcurrentJobs => {
                                 if let Ok(n) = val.parse::<usize>() {
                                     if (1..=8).contains(&n) {
@@ -1508,6 +1722,31 @@ impl App {
                                     } else {
                                         self.set_toast("Must be between 1 and 8", true);
                                     }
+                                } else {
+                                    self.set_toast("Invalid number", true);
+                                }
+                            }
+                            TextPromptKind::SpeedLimit => {
+                                if let Ok(n) = val.parse::<u64>() {
+                                    self.config.downloads.speed_limit_kbps = n;
+                                    self.engine.set_speed_limit_kbps(n);
+                                    self.persist_config().await;
+                                    self.set_toast(
+                                        if n == 0 {
+                                            "Speed limit disabled (unlimited)".to_string()
+                                        } else {
+                                            format!("Speed limit set to {} KB/s", n)
+                                        },
+                                        false,
+                                    );
+                                } else {
+                                    self.set_toast("Invalid number", true);
+                                }
+                            }
+                            TextPromptKind::MinFreeDiskMb => {
+                                if let Ok(n) = val.parse::<u64>() {
+                                    self.config.downloads.min_free_disk_mb = n;
+                                    self.persist_config().await;
                                 } else {
                                     self.set_toast("Invalid number", true);
                                 }
@@ -1533,6 +1772,14 @@ impl App {
     }
 
     fn trigger_search(&mut self) {
+        self.trigger_search_with_offset(true);
+    }
+
+    fn trigger_search_with_offset(&mut self, reset_offset: bool) {
+        if reset_offset {
+            self.search_offset = 0;
+        }
+        self.search_marked.clear();
         let enabled = self.config.enabled_indexers();
         if enabled.is_empty() {
             self.set_toast(
@@ -1552,6 +1799,8 @@ impl App {
         let query = self.search_query.clone();
         let cat = CATEGORIES[self.search_category_idx].id.to_string();
         let season = self.search_season.trim().to_string();
+        let episode = self.search_episode.trim().to_string();
+        let offset = self.search_offset;
         let limit = self.config.ui.search_limit;
         let client = Arc::clone(&self.newznab);
         let tx = self.async_tx.clone();
@@ -1564,29 +1813,41 @@ impl App {
             } else {
                 Some(season.as_str())
             };
+            let episode_opt = if episode.is_empty() {
+                None
+            } else {
+                Some(episode.as_str())
+            };
             engine
                 .log(
                     LogLevel::Info,
                     format!(
-                        "Searching {} indexer(s) for '{}' (cat={}, season={})",
+                        "Searching {} indexer(s) for '{}' (cat={}, season={}, ep={}, offset={})",
                         target_indexers.len(),
                         if query.is_empty() { "<latest>" } else { &query },
                         if cat.is_empty() { "all" } else { &cat },
-                        season_opt.unwrap_or("all")
+                        season_opt.unwrap_or("all"),
+                        episode_opt.unwrap_or("all"),
+                        offset
                     ),
                 )
                 .await;
             let (results, errors) = client
-                .search_all(&target_indexers, &query, &cat, season_opt, limit)
+                .search_all(
+                    &target_indexers,
+                    &query,
+                    &cat,
+                    season_opt,
+                    episode_opt,
+                    offset,
+                    limit,
+                )
                 .await;
             let _ = tx.send(AsyncEvent::SearchCompleted { results, errors });
         });
     }
 
-    fn download_selected_search_result(&mut self) {
-        let Some(item) = self.search_results.get(self.search_selected).cloned() else {
-            return;
-        };
+    fn download_selected_or_marked_search_results(&mut self) {
         if self.config.enabled_providers_sorted().is_empty() {
             self.set_toast(
                 "Configure a Usenet provider first ([3] Settings -> Providers -> [a])",
@@ -1595,39 +1856,143 @@ impl App {
             return;
         }
 
-        let client = Arc::clone(&self.newznab);
-        let engine = Arc::clone(&self.engine);
-        let tx = self.async_tx.clone();
-        self.set_toast(format!("Fetching NZB: {}…", item.title), false);
+        let items: Vec<SearchResult> = if !self.search_marked.is_empty() {
+            let marked = std::mem::take(&mut self.search_marked);
+            self.search_results
+                .iter()
+                .filter(|r| marked.contains(&r.guid))
+                .cloned()
+                .collect()
+        } else if let Some(item) = self.search_results.get(self.search_selected).cloned() {
+            vec![item]
+        } else {
+            return;
+        };
 
-        tokio::spawn(async move {
-            match client.fetch_nzb(&item.nzb_url, &item.indexer_api_key).await {
-                Ok(bytes) => match NzbDocument::parse(&bytes, &item.title) {
-                    Ok(mut nzb) => {
-                        if !item.title.trim().is_empty()
-                            && !crate::nzb::is_obfuscated_name(&item.title)
-                        {
-                            nzb.title = item.title.trim().to_string();
+        if items.is_empty() {
+            return;
+        }
+
+        if items.len() == 1 {
+            self.set_toast(format!("Fetching NZB: {}…", items[0].title), false);
+        } else {
+            self.set_toast(format!("Fetching {} marked NZBs…", items.len()), false);
+        }
+
+        for item in items {
+            let client = Arc::clone(&self.newznab);
+            let engine = Arc::clone(&self.engine);
+            let tx = self.async_tx.clone();
+            tokio::spawn(async move {
+                match client.fetch_nzb(&item.nzb_url, &item.indexer_api_key).await {
+                    Ok(bytes) => match NzbDocument::parse(&bytes, &item.title) {
+                        Ok(mut nzb) => {
+                            if !item.title.trim().is_empty()
+                                && !crate::nzb::is_obfuscated_name(&item.title)
+                            {
+                                nzb.title = item.title.trim().to_string();
+                            }
+                            if nzb.category.is_none() && !item.category.is_empty() {
+                                nzb.category = Some(item.category.clone());
+                            }
+                            let title = nzb.title.clone();
+                            engine.enqueue_nzb(nzb).await;
+                            let _ = tx.send(AsyncEvent::NzbEnqueued {
+                                guid: item.guid,
+                                title,
+                            });
                         }
-                        if nzb.category.is_none() && !item.category.is_empty() {
-                            nzb.category = Some(item.category.clone());
+                        Err(e) => {
+                            let _ = tx.send(AsyncEvent::NzbError(format!("NZB parse error: {}", e)));
                         }
-                        let title = nzb.title.clone();
-                        engine.enqueue_nzb(nzb).await;
-                        let _ = tx.send(AsyncEvent::NzbEnqueued {
-                            guid: item.guid,
-                            title,
-                        });
-                    }
+                    },
                     Err(e) => {
-                        let _ = tx.send(AsyncEvent::NzbError(format!("NZB parse error: {}", e)));
+                        let _ = tx.send(AsyncEvent::NzbError(format!("NZB fetch failed: {}", e)));
                     }
-                },
-                Err(e) => {
-                    let _ = tx.send(AsyncEvent::NzbError(format!("NZB fetch failed: {}", e)));
                 }
+            });
+        }
+    }
+
+    fn cycle_tab_forward(&mut self) {
+        match self.active_tab {
+            ActiveTab::Search => {
+                self.active_tab = ActiveTab::Downloads;
+                self.downloads_pane = DownloadsPane::Queue;
             }
+            ActiveTab::Downloads => match self.downloads_pane {
+                DownloadsPane::Queue => self.downloads_pane = DownloadsPane::History,
+                DownloadsPane::History => {
+                    self.active_tab = ActiveTab::Settings;
+                    self.settings_section = SettingsSection::Providers;
+                }
+            },
+            ActiveTab::Settings => match self.settings_section {
+                SettingsSection::Providers => self.settings_section = SettingsSection::Indexers,
+                SettingsSection::Indexers => self.settings_section = SettingsSection::General,
+                SettingsSection::General => self.settings_section = SettingsSection::Export,
+                SettingsSection::Export => self.active_tab = ActiveTab::Logs,
+            },
+            ActiveTab::Logs => self.active_tab = ActiveTab::Export,
+            ActiveTab::Export => self.active_tab = ActiveTab::Search,
+        }
+    }
+
+    fn cycle_tab_backward(&mut self) {
+        match self.active_tab {
+            ActiveTab::Search => self.active_tab = ActiveTab::Export,
+            ActiveTab::Downloads => match self.downloads_pane {
+                DownloadsPane::Queue => self.active_tab = ActiveTab::Search,
+                DownloadsPane::History => self.downloads_pane = DownloadsPane::Queue,
+            },
+            ActiveTab::Settings => match self.settings_section {
+                SettingsSection::Providers => {
+                    self.active_tab = ActiveTab::Downloads;
+                    self.downloads_pane = DownloadsPane::History;
+                }
+                SettingsSection::Indexers => self.settings_section = SettingsSection::Providers,
+                SettingsSection::General => self.settings_section = SettingsSection::Indexers,
+                SettingsSection::Export => self.settings_section = SettingsSection::General,
+            },
+            ActiveTab::Logs => {
+                self.active_tab = ActiveTab::Settings;
+                self.settings_section = SettingsSection::Export;
+            }
+            ActiveTab::Export => self.active_tab = ActiveTab::Logs,
+        }
+    }
+
+    fn trigger_self_update(&mut self) {
+        self.set_toast("Checking GitHub for updates…", false);
+        let tx = self.async_tx.clone();
+        tokio::spawn(async move {
+            let res = crate::updater::check_and_self_update(true, false)
+                .await
+                .map(|o| o.message)
+                .map_err(|e| e.to_string());
+            let _ = tx.send(AsyncEvent::UpdateResult(res));
         });
+    }
+
+    fn open_in_file_manager(&mut self, path: &std::path::Path) {
+        let target = if path.is_file() {
+            path.parent().unwrap_or(path)
+        } else {
+            path
+        };
+        if !target.exists() {
+            self.set_toast(format!("Path does not exist: {}", target.display()), true);
+            return;
+        }
+        match std::process::Command::new("xdg-open")
+            .arg(target)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(_) => self.set_toast(format!("Opened {}", target.display()), false),
+            Err(e) => self.set_toast(format!("Failed to open folder: {}", e), true),
+        }
     }
 
     fn apply_search_sort(&mut self) {

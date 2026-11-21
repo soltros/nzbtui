@@ -5,6 +5,7 @@ mod nntp;
 mod nzb;
 mod postproc;
 mod ui;
+mod updater;
 mod yenc;
 
 use anyhow::Result;
@@ -45,6 +46,10 @@ struct Cli {
     /// Print default config file path and exit
     #[arg(long)]
     print_config_path: bool,
+
+    /// Check GitHub releases for a newer version and self-update the binary
+    #[arg(long)]
+    update: bool,
 }
 
 #[tokio::main]
@@ -58,6 +63,12 @@ async fn main() -> Result<()> {
 
     if cli.print_config_path {
         println!("{}", config_path.display());
+        return Ok(());
+    }
+
+    if cli.update {
+        let outcome = updater::check_and_self_update(true, true).await?;
+        println!("{}", outcome.message);
         return Ok(());
     }
 

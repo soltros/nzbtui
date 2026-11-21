@@ -31,6 +31,14 @@ pub struct DownloadConfig {
     #[serde(default = "default_max_concurrent_jobs")]
     pub max_concurrent_jobs: usize,
     #[serde(default)]
+    pub watch_dir: Option<PathBuf>,
+    #[serde(default)]
+    pub speed_limit_kbps: u64,
+    #[serde(default)]
+    pub min_free_disk_mb: u64,
+    #[serde(default)]
+    pub auto_export: bool,
+    #[serde(default)]
     pub post_process: PostProcessConfig,
 }
 
@@ -130,6 +138,10 @@ impl Default for DownloadConfig {
             download_dir,
             temp_dir,
             max_concurrent_jobs: default_max_concurrent_jobs(),
+            watch_dir: None,
+            speed_limit_kbps: 0,
+            min_free_disk_mb: 0,
+            auto_export: false,
             post_process: PostProcessConfig::default(),
         }
     }
@@ -216,6 +228,9 @@ impl AppConfig {
             .with_context(|| format!("Failed to parse JSON config {}", path.display()))?;
         cfg.downloads.download_dir = expand_tilde(&cfg.downloads.download_dir);
         cfg.downloads.temp_dir = expand_tilde(&cfg.downloads.temp_dir);
+        if let Some(ref wd) = cfg.downloads.watch_dir {
+            cfg.downloads.watch_dir = Some(expand_tilde(wd));
+        }
         for target in &mut cfg.export_targets {
             target.path = expand_tilde(&target.path);
         }
@@ -271,6 +286,26 @@ impl AppConfig {
             .iter()
             .find(|t| t.tag.eq_ignore_ascii_case(tag))
             .map(|t| &t.path)
+    }
+
+    /// Matches a job's category (e.g. "Movies > HD", "TV") against configured export target tags.
+    pub fn match_export_target_for_category(&self, category: Option<&str>) -> Option<&ExportTarget> {
+        let cat = category?.trim().to_lowercase();
+        if cat.is_empty() {
+            return None;
+        }
+        // Exact match first, then substring/plural match (e.g. "Movies" <-> "Movie")
+        if let Some(exact) = self
+            .export_targets
+            .iter()
+            .find(|t| t.tag.eq_ignore_ascii_case(&cat))
+        {
+            return Some(exact);
+        }
+        self.export_targets.iter().find(|t| {
+            let tag_l = t.tag.trim().to_lowercase();
+            !tag_l.is_empty() && (cat.contains(&tag_l) || tag_l.contains(&cat))
+        })
     }
 }
 

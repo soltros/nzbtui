@@ -82,11 +82,13 @@ impl NewznabClient {
         query: &str,
         category_id: &str,
         season: Option<&str>,
+        episode: Option<&str>,
+        offset: usize,
         limit: usize,
     ) -> (Vec<SearchResult>, Vec<String>) {
         let futures = indexers
             .iter()
-            .map(|idx| self.search_one(idx, query, category_id, season, limit));
+            .map(|idx| self.search_one(idx, query, category_id, season, episode, offset, limit));
         let outcomes = join_all(futures).await;
 
         let mut results = Vec::new();
@@ -110,10 +112,13 @@ impl NewznabClient {
         query: &str,
         category_id: &str,
         season: Option<&str>,
+        episode: Option<&str>,
+        offset: usize,
         limit: usize,
     ) -> Result<Vec<SearchResult>> {
         let endpoint = indexer.api_endpoint();
-        let params = build_search_params(&indexer.api_key, query, category_id, season, limit);
+        let params =
+            build_search_params(&indexer.api_key, query, category_id, season, episode, offset, limit);
 
         let resp = self
             .http
@@ -462,10 +467,13 @@ pub fn build_search_params(
     query: &str,
     category_id: &str,
     season: Option<&str>,
+    episode: Option<&str>,
+    offset: usize,
     limit: usize,
 ) -> Vec<(&'static str, String)> {
     let season_trimmed = season.map(str::trim).filter(|s| !s.is_empty());
-    let search_type = if season_trimmed.is_some() {
+    let episode_trimmed = episode.map(str::trim).filter(|s| !s.is_empty());
+    let search_type = if season_trimmed.is_some() || episode_trimmed.is_some() {
         "tvsearch"
     } else {
         "search"
@@ -476,6 +484,9 @@ pub fn build_search_params(
         ("extended", "1".to_string()),
         ("limit", limit.to_string()),
     ];
+    if offset > 0 {
+        params.push(("offset", offset.to_string()));
+    }
     if !query.trim().is_empty() {
         params.push(("q", query.trim().to_string()));
     }
@@ -484,6 +495,9 @@ pub fn build_search_params(
     }
     if let Some(s) = season_trimmed {
         params.push(("season", s.to_string()));
+    }
+    if let Some(ep) = episode_trimmed {
+        params.push(("ep", ep.to_string()));
     }
     params
 }
@@ -530,19 +544,22 @@ mod tests {
 
     #[test]
     fn test_build_search_params_with_season() {
-        let normal = build_search_params("key", "ubuntu", "4000", None, 100);
+        let normal = build_search_params("key", "ubuntu", "4000", None, None, 0, 100);
         assert!(normal.contains(&("t", "search".to_string())));
         assert!(!normal.iter().any(|(k, _)| *k == "season"));
+        assert!(!normal.iter().any(|(k, _)| *k == "offset"));
 
-        let packs = build_search_params("key", "South Park", "5000", Some("00"), 100);
+        let packs = build_search_params("key", "South Park", "5000", Some("00"), None, 0, 100);
         assert!(packs.contains(&("t", "tvsearch".to_string())));
         assert!(packs.contains(&("season", "00".to_string())));
         assert!(packs.contains(&("q", "South Park".to_string())));
         assert!(packs.contains(&("cat", "5000".to_string())));
 
-        let s2 = build_search_params("key", "Severance", "", Some(" 2 "), 50);
-        assert!(s2.contains(&("t", "tvsearch".to_string())));
-        assert!(s2.contains(&("season", "2".to_string())));
-        assert!(!s2.iter().any(|(k, _)| *k == "cat"));
+        let s2e5 = build_search_params("key", "Severance", "", Some(" 2 "), Some("5"), 100, 50);
+        assert!(s2e5.contains(&("t", "tvsearch".to_string())));
+        assert!(s2e5.contains(&("season", "2".to_string())));
+        assert!(s2e5.contains(&("ep", "5".to_string())));
+        assert!(s2e5.contains(&("offset", "100".to_string())));
+        assert!(!s2e5.iter().any(|(k, _)| *k == "cat"));
     }
 }
